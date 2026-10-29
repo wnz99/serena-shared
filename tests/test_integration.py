@@ -18,6 +18,9 @@ from mcp.client.stdio import stdio_client
 pytestmark = pytest.mark.skipif(shutil.which("serena") is None, reason="serena not installed")
 
 SHIM = str(Path(sys.executable).with_name("serena-shared"))
+# Shared servers always run without a dashboard; these flags matter for the private-Serena
+# fallback, which would otherwise open a browser tab with a fresh SERENA_HOME's defaults.
+NO_DASHBOARD = ("--enable-web-dashboard", "false", "--open-web-dashboard", "false")
 
 
 @pytest.fixture
@@ -50,7 +53,7 @@ def servers(env) -> list[dict]:
 async def use_serena(repo, env, context, hold: anyio.Event | None = None) -> set[str]:
     params = StdioServerParameters(
         command=SHIM,
-        args=["start-mcp-server", f"--context={context}", "--project-from-cwd", "--agent-interface", "tools"],
+        args=["start-mcp-server", f"--context={context}", "--project-from-cwd", "--agent-interface", "tools", *NO_DASHBOARD],
         cwd=str(repo),
         env=env,
     )
@@ -115,7 +118,7 @@ def test_shared_server_cannot_switch_projects(repo, env):
     async def scenario():
         params = StdioServerParameters(
             command=SHIM,
-            args=["start-mcp-server", "--context=codex", "--project-from-cwd", "--agent-interface", "tools"],
+            args=["start-mcp-server", "--context=codex", "--project-from-cwd", "--agent-interface", "tools", *NO_DASHBOARD],
             cwd=str(repo),
             env=env,
         )
@@ -185,7 +188,7 @@ INITIALIZE = json.dumps({
 def start_raw_client(repo, env) -> subprocess.Popen:
     """A client that, unlike the SDK's, never escalates to SIGKILL on its own."""
     proc = subprocess.Popen(
-        [SHIM, "start-mcp-server", "--context=codex", "--project-from-cwd", "--agent-interface", "tools"],
+        [SHIM, "start-mcp-server", "--context=codex", "--project-from-cwd", "--agent-interface", "tools", *NO_DASHBOARD],
         cwd=repo, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
     )
     proc.stdin.write(INITIALIZE)
@@ -221,7 +224,7 @@ def test_supervisor_signalled_during_startup_leaves_no_orphan(repo, env, sig):
 
     state_dir = Path(env["SERENA_SHARED_STATE_DIR"])
     first = subprocess.Popen(
-        [SHIM, "start-mcp-server", "--context=codex", "--project-from-cwd", "--agent-interface", "tools"],
+        [SHIM, "start-mcp-server", "--context=codex", "--project-from-cwd", "--agent-interface", "tools", *NO_DASHBOARD],
         cwd=repo, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
     )
     deadline = time.monotonic() + 60
