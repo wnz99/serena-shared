@@ -1,6 +1,6 @@
 [project]
 name = "serena-shared"
-version = "0.2.0"
+version = "0.2.1"
 description = "Share one Serena MCP server per repository across concurrent Claude Code, Codex and other MCP clients."
 readme = "README.md"
 requires-python = ">=3.11"

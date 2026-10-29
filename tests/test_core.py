@@ -142,3 +142,25 @@ def test_discard_never_signals_a_reused_supervisor_pid(tmp_path, monkeypatch):
             assert victim.poll() is None
         finally:
             victim.kill()
+
+
+TRAMPOLINE_RELATIVE = """#!/bin/sh
+'''exec' "$(dirname -- "$(realpath -- "$0")")"/'python' "$0" "$@"
+' '''
+"""
+TRAMPOLINE_ABSOLUTE = """#!/bin/sh
+'''exec' '/very/long/venv/bin/python3' "$0" "$@"
+' '''
+"""
+
+
+def test_reads_pip_and_uv_sh_trampolines(tmp_path):
+    from serena_shared.core import serena_python
+
+    relative = tmp_path / "bin" / "serena"
+    relative.parent.mkdir()
+    relative.write_text(TRAMPOLINE_RELATIVE)
+    assert serena_python(str(relative)) == str(tmp_path / "bin" / "python")
+    absolute = tmp_path / "serena-abs"
+    absolute.write_text(TRAMPOLINE_ABSOLUTE)
+    assert serena_python(str(absolute)) == "/very/long/venv/bin/python3"

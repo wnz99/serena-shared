@@ -42,9 +42,10 @@ You need:
    uv tool install serena-agent
    ```
 
-   serena-shared needs Serena installed this way (or with `pipx`), so that the `serena` command
-   is a regular file. Configurations that run Serena through `uvx --from git+...` each time are
-   not shared; they keep working as before.
+   serena-shared needs the `serena` command to be a regular launcher file, as `uv tool install`
+   and `pipx` create. Configurations that run Serena through `uvx --from git+...` each time are
+   not shared; they keep working as before. To share a pinned Serena version, point
+   `SERENA_SHARED_SERENA` at the `serena` launcher inside that version's environment.
 
 ## Install
 

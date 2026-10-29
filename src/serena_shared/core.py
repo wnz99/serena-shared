@@ -7,6 +7,7 @@ import fcntl
 import hashlib
 import json
 import os
+import re
 import secrets
 import signal
 import socket
@@ -110,20 +111,34 @@ def atomic_write(path: Path, text: str) -> None:
         raise
 
 
+# Second line of the `#!/bin/sh` launchers pip and uv write when the interpreter path is too
+# long for a shebang: the interpreter is either next to the launcher or an absolute path.
+_TRAMPOLINE_RELATIVE = re.compile(
+    r"""^'''exec' "\$\(dirname -- "\$\(realpath -- "\$0"\)"\)"/'([^'/]+)' "\$0" "\$@"$"""
+)
+_TRAMPOLINE_ABSOLUTE = re.compile(r"""^'''exec' '(/[^']+)' "\$0" "\$@"$""")
+
+
 def serena_python(serena: str) -> str:
-    """Serena's interpreter, from its launcher's shebang."""
+    """Serena's interpreter, from its launcher's shebang or sh trampoline."""
+    launcher = os.path.realpath(serena)
     try:
-        with open(os.path.realpath(serena), "rb") as f:
-            shebang = f.readline().decode().strip()
+        with open(launcher, "rb") as f:
+            first, second = f.readline().decode().strip(), f.readline().decode().strip()
     except (OSError, UnicodeDecodeError) as exc:
         raise NotShareable(f"cannot read {serena}: {exc}") from exc
-    interpreter = shebang[2:]
+    interpreter = first[2:]
+    if first == "#!/bin/sh":
+        if match := _TRAMPOLINE_RELATIVE.match(second):
+            interpreter = os.path.join(os.path.dirname(launcher), match.group(1))
+        elif match := _TRAMPOLINE_ABSOLUTE.match(second):
+            interpreter = match.group(1)
     if (
-        not shebang.startswith("#!/")
+        not first.startswith("#!/")
         or " " in interpreter
         or not os.path.basename(interpreter).startswith("python")
     ):
-        raise NotShareable(f"{serena} is not a Python launcher with a direct interpreter path")
+        raise NotShareable(f"{serena} is not a Python launcher with a recognisable interpreter")
     return interpreter
 
 
