@@ -17,11 +17,10 @@ import time
 from pathlib import Path
 from typing import IO
 
-from serena_shared.core import ServerState, kill_group, socket_ready
+from serena_shared.core import STOP_GRACE_SECONDS, ServerState, kill_group, socket_ready
 
 POLL_SECONDS = 5
 START_TIMEOUT_SECONDS = 180
-STOP_GRACE_SECONDS = 10
 MAX_LOG_BYTES = 5 * 1024 * 1024
 
 
@@ -45,10 +44,10 @@ def _rotate_log(state: ServerState) -> None:
         pass
 
 
-def _start(state: ServerState, spec: dict, server_lock_fd: int) -> subprocess.Popen | None:
+def _launch(state: ServerState, spec: dict, server_lock_fd: int) -> subprocess.Popen:
     state.socket.unlink(missing_ok=True)  # left by a server that was killed
     with open(state.log_file, "ab") as log:
-        child = subprocess.Popen(
+        return subprocess.Popen(
             spec["command"],
             cwd=spec["root"],
             stdin=subprocess.DEVNULL,
@@ -56,14 +55,18 @@ def _start(state: ServerState, spec: dict, server_lock_fd: int) -> subprocess.Po
             stderr=log,
             start_new_session=True,
             pass_fds=(server_lock_fd,),  # Serena keeps server.lock held if we die first
+            # run() blocks stop signals around this call; Serena must not inherit that mask.
+            preexec_fn=lambda: signal.pthread_sigmask(signal.SIG_SETMASK, set()),  # noqa: PLW1509 - no threads here
         )
+
+
+def _wait_ready(state: ServerState, child: subprocess.Popen) -> bool:
     deadline = time.monotonic() + START_TIMEOUT_SECONDS
     while child.poll() is None and time.monotonic() < deadline:
         if socket_ready(str(state.socket)) and child.poll() is None:
-            return child
+            return True
         time.sleep(0.2)
-    _stop(child)
-    return None
+    return False
 
 
 def run(state: ServerState, server_lock: IO[str]) -> int:
@@ -84,17 +87,21 @@ def run(state: ServerState, server_lock: IO[str]) -> int:
     signal.signal(signal.SIGHUP, signal.SIG_IGN)
 
     _rotate_log(state)
-    # The client that started us holds `lock` and is waiting on this record.
-    state.write_json(state.server_file, {"state": "starting", "supervisor_pid": me})
-    child = _start(state, spec, server_lock.fileno())
-    if child is None:
+    # The client that started us holds `lock` and is waiting on this record. Serena's PID is
+    # in it from the start, so a client can clean up even if we die during startup.
+    stop_signals = {signal.SIGTERM, signal.SIGINT}
+    signal.pthread_sigmask(signal.SIG_BLOCK, stop_signals)  # no signal between launch and assignment
+    try:
+        child = _launch(state, spec, server_lock.fileno())
+    finally:
+        signal.pthread_sigmask(signal.SIG_UNBLOCK, stop_signals)
+    record = {"supervisor_pid": me, "serena_pid": child.pid, "socket": str(state.socket), "root": spec["root"]}
+    state.write_json(state.server_file, {"state": "starting", **record})
+    if not _wait_ready(state, child):
+        _stop(child)
         state.remove_record_if_owned(me)
         return 1
-    state.write_json(
-        state.server_file,
-        {"state": "running", "supervisor_pid": me, "serena_pid": child.pid,
-         "socket": str(state.socket), "root": spec["root"]},
-    )
+    state.write_json(state.server_file, {"state": "running", **record})
 
     try:
         idle_seconds = spec["idle_seconds"]
@@ -126,8 +133,8 @@ def main() -> None:
     state = ServerState(Path(sys.argv[1]))
     # Take both locks before detaching: the forked child shares the locked files, so they are
     # already held when the launching client sees this process exit.
-    supervisor_lock = open(state.supervisor_lock, "a")
-    server_lock = open(state.server_lock, "a")
+    supervisor_lock = open(state.supervisor_lock, "a")  # noqa: SIM115 - held for the process lifetime
+    server_lock = open(state.server_lock, "a")  # noqa: SIM115 - held for the process lifetime
     try:
         fcntl.flock(supervisor_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         fcntl.flock(server_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)

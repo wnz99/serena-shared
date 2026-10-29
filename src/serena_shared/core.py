@@ -27,12 +27,17 @@ HTTP_BASE = f"http://{HOST}:1"
 SERVE_UNIX = Path(__file__).with_name("serve_unix.py")
 MAX_SOCKET_PATH = 100  # bytes; AF_UNIX allows 104 on macOS, 108 on Linux
 DEFAULT_CONTEXT = "desktop-app"  # Serena's own default
+STOP_GRACE_SECONDS = 10
+STRAY_LEASE_SECONDS = 60
+# Part of every server key: bump when the on-disk protocol changes, so servers started by an
+# older serena-shared keep their own state directory and idle out undisturbed.
+STATE_VERSION = 2
 
 # Serena options the shim owns; client-supplied values are dropped.
 _OWNED_FLAGS = {
     "--transport", "--host", "--port", "--project", "--project-file", "--context",
-    # A background shared server must not open a dashboard port or a browser tab.
-    "--enable-web-dashboard", "--open-web-dashboard",
+    # A background shared server must not open a dashboard port, a browser tab or a window.
+    "--enable-web-dashboard", "--open-web-dashboard", "--enable-gui-log-window",
 }
 _OWNED_SWITCHES = {"--project-from-cwd"}
 
@@ -165,6 +170,7 @@ def server_args(args: Sequence[str], root: Path, context_file: Path) -> list[str
         "--host", HOST,
         "--enable-web-dashboard", "false",
         "--open-web-dashboard", "false",
+        "--enable-gui-log-window", "false",
     ]
     return out
 
@@ -172,7 +178,7 @@ def server_args(args: Sequence[str], root: Path, context_file: Path) -> list[str
 def server_key(serena: str, args: Sequence[str]) -> str:
     """Servers are shared only between clients that would have started an identical server."""
     material = json.dumps(
-        [os.path.realpath(serena), list(args), os.environ.get("SERENA_HOME", "")],
+        [STATE_VERSION, os.path.realpath(serena), list(args), os.environ.get("SERENA_HOME", "")],
     )
     return hashlib.sha256(material.encode()).hexdigest()[:20]
 
@@ -323,16 +329,20 @@ class ServerState:
 
     def discard(self, record: ServerRecord) -> None:
         """Stop whatever an unhealthy record still points at and remove it. Caller holds `lock`."""
-        if self.server_alive():  # the PIDs still belong to this server
-            supervisor_pid = record.get("supervisor_pid", 0)
-            if supervisor_pid > 0:
-                with contextlib.suppress(ProcessLookupError, PermissionError):
-                    os.kill(supervisor_pid, signal.SIGTERM)
+        # Each PID is signalled only while a lock proves it still belongs to this server:
+        # supervisor.lock is held only by the supervisor, server.lock also by Serena.
+        supervisor_pid = record.get("supervisor_pid", 0)
+        if supervisor_pid > 0 and self.supervisor_alive():
+            with contextlib.suppress(ProcessLookupError, PermissionError):
+                os.kill(supervisor_pid, signal.SIGTERM)
+        if self.server_alive():
             kill_group(record.get("serena_pid", 0), signal.SIGKILL)
-            deadline = time.monotonic() + 10
-            while self.server_alive() and time.monotonic() < deadline:
-                time.sleep(0.1)
+        deadline = time.monotonic() + STOP_GRACE_SECONDS
+        while self.server_alive() and time.monotonic() < deadline:
+            time.sleep(0.1)
         self.server_file.unlink(missing_ok=True)
+        if self.server_alive():
+            raise NotShareable(f"processes of a previous server are still running; see {self.log_file}")
 
     def remove_record_if_owned(self, supervisor_pid: int) -> None:
         record = self.read_server()
@@ -344,16 +354,22 @@ class ServerState:
         drops the lock when the process dies, however it dies, so liveness never depends on
         PIDs that may be reused."""
         name = f"{os.getpid()}-{secrets.token_hex(4)}"
-        handle = open(self.dir / f".{name}", "w")
+        handle = open(self.leases / f".{name}", "w")  # noqa: SIM115 - held for the client lifetime
         fcntl.flock(handle, fcntl.LOCK_EX)
         # Publish only once locked, so the reaper never sees an unlocked live lease.
-        os.rename(self.dir / f".{name}", self.leases / name)
+        os.rename(self.leases / f".{name}", self.leases / name)
         return handle
 
     def live_leases(self) -> int:
         """Count leases still locked by a live client; remove the rest."""
         count = 0
         for lease in list(self.leases.iterdir()):
+            if lease.name.startswith("."):  # not yet published, or left by a client that died then
+                with contextlib.suppress(FileNotFoundError):
+                    stale = time.time() - lease.stat().st_mtime > STRAY_LEASE_SECONDS
+                    if stale and not is_locked(lease):
+                        lease.unlink(missing_ok=True)
+                continue
             if is_locked(lease):
                 count += 1
             else:

@@ -1,5 +1,6 @@
 """End-to-end: real Serena, real MCP clients. Skipped when `serena` is not installed."""
 
+import contextlib
 import json
 import os
 import shutil
@@ -213,3 +214,39 @@ def test_relay_exits_and_releases_its_lease(repo, env, how):
     while servers(env) and time.monotonic() < deadline:  # idle timeout is 3 s
         time.sleep(1)
     assert servers(env) == []
+
+
+def test_supervisor_signalled_during_startup_leaves_no_orphan(repo, env):
+    import signal
+
+    state_dir = Path(env["SERENA_SHARED_STATE_DIR"])
+    first = subprocess.Popen(
+        [SHIM, "start-mcp-server", "--context=codex", "--project-from-cwd", "--agent-interface", "tools"],
+        cwd=repo, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+    )
+    deadline = time.monotonic() + 60
+    starting = None
+    while starting is None and time.monotonic() < deadline:
+        for path in state_dir.glob("*/server.json"):
+            with contextlib.suppress(ValueError, OSError):
+                record = json.loads(path.read_text())
+                if record.get("state") == "starting":
+                    starting = record
+        time.sleep(0.01)
+    assert starting, "never saw a starting server"
+    os.kill(starting["supervisor_pid"], signal.SIGTERM)
+
+    # The waiting client falls back to a private Serena and still works.
+    first.stdin.write(INITIALIZE)
+    first.stdin.flush()
+    assert '"result"' in first.stdout.readline()
+    first.stdin.close()
+    first.wait(timeout=30)
+
+    deadline = time.monotonic() + 15
+    while not process_gone(starting["serena_pid"]) and time.monotonic() < deadline:
+        time.sleep(0.2)
+    assert process_gone(starting["serena_pid"]), "Serena orphaned by a supervisor killed during startup"
+
+    # And the project is not wedged: the next client gets a fresh shared server.
+    anyio.run(use_serena, repo, env, "codex")

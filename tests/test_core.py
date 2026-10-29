@@ -41,6 +41,7 @@ def test_server_args_pin_project_context_and_own_transport(tmp_path):
         "start-mcp-server", "--log-level", "WARNING",
         "--context", str(ctx), "--project", str(tmp_path), "--transport", "streamable-http",
         "--host", "127.0.0.1", "--enable-web-dashboard", "false", "--open-web-dashboard", "false",
+        "--enable-gui-log-window", "false",
     ]
 
 
@@ -118,3 +119,27 @@ def test_rejects_non_python_launchers(tmp_path):
     launcher = tmp_path / "serena2"
     launcher.write_text("#!/opt/venv/bin/python3.12\nimport serena\n")
     assert serena_python(str(launcher)) == "/opt/venv/bin/python3.12"
+
+
+def test_discard_never_signals_a_reused_supervisor_pid(tmp_path, monkeypatch):
+    import fcntl
+    import subprocess
+
+    import pytest
+
+    from serena_shared.core import NotShareable
+
+    monkeypatch.setenv("SERENA_SHARED_STATE_DIR", str(tmp_path / "s"))
+    state = ServerState.for_key("k")
+    # Serena outlived a SIGKILLed supervisor (server.lock held), and the supervisor's PID now
+    # belongs to an unrelated process.
+    holder = open(state.server_lock, "a")
+    fcntl.flock(holder, fcntl.LOCK_EX)
+    victim = subprocess.Popen(["sleep", "30"])
+    try:
+        with pytest.raises(NotShareable):
+            state.discard({"state": "running", "supervisor_pid": victim.pid, "serena_pid": 0})
+        assert victim.poll() is None
+    finally:
+        victim.kill()
+        holder.close()

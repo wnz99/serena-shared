@@ -22,7 +22,7 @@ def _init_with_unix_socket(self, *args, **kwargs):
 
 uvicorn.Config.__init__ = _init_with_unix_socket
 
-from serena.cli import top_level  # noqa: E402
+from serena.cli import top_level
 
 sys.argv = ["serena", *sys.argv[2:]]
 sys.exit(top_level())

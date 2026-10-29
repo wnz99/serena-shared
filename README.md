@@ -139,12 +139,21 @@ All settings are optional environment variables. Set them in the agent's MCP con
 | `SERENA_SHARED_IDLE_SECONDS` | `1800` (30 minutes) | How long a server keeps running after its last session closes |
 | `SERENA_SHARED_STATE_DIR` | `~/.local/state/serena-shared` (or `$XDG_STATE_HOME/serena-shared`) | Where sockets, locks and logs are kept. It must be a folder that belongs to you. Keep the path short: Unix socket paths are limited to about 100 characters |
 
-Each server writes its log to `<state dir>/<server id>/server.log`. The log is rotated to
-`server.log.1` when it passes 5 MB.
+Each server writes its log to `<state dir>/<server id>/server.log`. When a server starts and
+the log is larger than 5 MB, the old log is moved to `server.log.1`.
 
 Options that control how the shared server is reached (`--transport`, `--host`, `--port`,
-`--project`) and Serena's web dashboard options are set by serena-shared; any values you pass
-for them are ignored.
+`--project`), Serena's web dashboard options and `--enable-gui-log-window` are set by
+serena-shared; any values you pass for them are ignored.
+
+## Upgrade
+
+```sh
+uv tool upgrade serena-shared
+```
+
+Then restart your agent sessions. Servers started by the previous version keep running for
+their existing sessions and stop on their own after the idle timeout.
 
 ## Uninstall
 
@@ -175,6 +184,9 @@ When an agent starts `serena-shared start-mcp-server --project-from-cwd ...`, se
 Each session holds a lock while it is connected. When no session has been connected for the
 idle timeout, the server stops together with its language servers. If a server or its
 supervisor crashes, the next session start cleans it up and starts a fresh one.
+
+If a shared server cannot be started or reached, the session runs its own private Serena, as
+it would without serena-shared, and the reason is printed to stderr.
 
 Any other use of the command (for example `serena-shared --version`, or a configuration without
 `--project-from-cwd`) runs Serena directly, unchanged.

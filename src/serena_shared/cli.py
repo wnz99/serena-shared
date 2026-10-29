@@ -42,7 +42,7 @@ from serena_shared.core import (
 )
 
 DEFAULT_IDLE_SECONDS = 1800
-START_WAIT_SECONDS = 200  # per spawn; Serena's first start can index a large project
+START_WAIT_SECONDS = 120  # Serena's socket opens after its agent and language backend start
 EXIT_GRACE_SECONDS = 5
 
 
@@ -83,6 +83,7 @@ def _spawn_supervisor(state: ServerState, command: list[str], root: Path) -> Non
             stdout=log,
             stderr=log,
             start_new_session=True,
+            check=False,  # a supervisor that cannot start is detected by _wait_until_running
         )
 
 
@@ -102,18 +103,24 @@ def _wait_until_running(state: ServerState) -> ServerRecord | None:
 def _attach(state: ServerState, command: list[str], root: Path) -> tuple[str, IO[str]]:
     """Return the socket of a healthy server for this key, starting one if needed, plus this
     client's lease. Runs under `lock`, and takes the lease before releasing it, so the
-    server cannot be reaped between attach and first request."""
+    server cannot be reaped between attach and first request.
+
+    Raises NotShareable when no shared server can be had; the caller then runs a private
+    Serena rather than leaving the client without one."""
     with state.locked():
         record = state.read_server()
-        if not state.healthy(record) and record and record.get("state") == "starting":
-            record = _wait_until_running(state)  # its starting client died while waiting
+        if record and not state.healthy(record) and record.get("state") == "starting" and state.supervisor_alive():
+            # Another client's start is still in progress (that client may have died waiting).
+            record = _wait_until_running(state)
+            if record is None and state.supervisor_alive():
+                raise NotShareable(f"the shared server is still starting; see {state.log_file}")
         if not state.healthy(record):
             if record or state.server_alive():
                 state.discard(record or {})
             _spawn_supervisor(state, command, root)
             record = _wait_until_running(state)
             if record is None:
-                _fail(f"shared Serena server failed to start; see {state.log_file}")
+                raise NotShareable(f"the shared server failed to start; see {state.log_file}")
         return record["socket"], state.take_lease()
 
 
@@ -197,6 +204,10 @@ def main() -> None:
         os.execv(serena, [serena, *args])
 
     command = [python, "-I", str(SERVE_UNIX), str(state.socket), *rewritten]
-    socket_path, lease = _attach(state, command, root)
+    try:
+        socket_path, lease = _attach(state, command, root)
+    except NotShareable as exc:
+        warn(f"not sharing, running a private Serena: {exc}")
+        os.execv(serena, [serena, *args])
     with lease:
         anyio.run(_relay, socket_path)
