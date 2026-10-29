@@ -137,9 +137,14 @@ All settings are optional environment variables. Set them in the agent's MCP con
 |---|---|---|
 | `SERENA_SHARED_SERENA` | `serena` on your `PATH` | Path to the Serena command to run |
 | `SERENA_SHARED_IDLE_SECONDS` | `1800` (30 minutes) | How long a server keeps running after its last session closes |
-| `SERENA_SHARED_STATE_DIR` | `~/.local/state/serena-shared` (or `$XDG_STATE_HOME/serena-shared`) | Where sockets, locks and logs are kept. Keep this path short: Unix socket paths are limited to about 100 characters |
+| `SERENA_SHARED_STATE_DIR` | `~/.local/state/serena-shared` (or `$XDG_STATE_HOME/serena-shared`) | Where sockets, locks and logs are kept. It must be a folder that belongs to you. Keep the path short: Unix socket paths are limited to about 100 characters |
 
-Each server writes its log to `<state dir>/<server id>/server.log`.
+Each server writes its log to `<state dir>/<server id>/server.log`. The log is rotated to
+`server.log.1` when it passes 5 MB.
+
+Options that control how the shared server is reached (`--transport`, `--host`, `--port`,
+`--project`) and Serena's web dashboard options are set by serena-shared; any values you pass
+for them are ignored.
 
 ## Uninstall
 
@@ -177,8 +182,13 @@ Any other use of the command (for example `serena-shared --version`, or a config
 ## Security
 
 Shared servers listen on a Unix socket inside the state directory, which only your user can
-access (permissions `0700`). They do not open a network port. Serena's MCP server also keeps
-its protection against requests from web pages (DNS-rebinding protection).
+access (permissions `0700`). They do not open a network port: serena-shared turns off Serena's
+web dashboard for shared servers, because a background server has no use for it and the
+dashboard would listen on a local TCP port. Serena's MCP server also keeps its protection
+against requests from web pages (DNS-rebinding protection).
+
+serena-shared refuses to use a state directory that is a symlink or belongs to another user,
+and runs a private Serena instead.
 
 ## Limitations
 
@@ -186,6 +196,8 @@ its protection against requests from web pages (DNS-rebinding protection).
   other's long-running calls.
 - A server keeps the environment (for example `PATH`) of the session that started it.
 - If a server stops while sessions are connected, those sessions lose Serena until they restart.
+- State folders for repositories or worktrees you have deleted are not removed automatically.
+  Delete them from the state directory when no server is running.
 - serena-shared starts Serena through its normal command-line entry point but asks the web server
   (uvicorn) to listen on a Unix socket. A future Serena release that stops using uvicorn would
   require an update to serena-shared.

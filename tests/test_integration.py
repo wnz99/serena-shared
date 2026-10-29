@@ -49,8 +49,7 @@ def servers(env) -> list[dict]:
 async def use_serena(repo, env, context, hold: anyio.Event | None = None) -> set[str]:
     params = StdioServerParameters(
         command=SHIM,
-        args=["start-mcp-server", f"--context={context}", "--project-from-cwd", "--agent-interface", "tools",
-              "--enable-web-dashboard", "false", "--open-web-dashboard", "false"],
+        args=["start-mcp-server", f"--context={context}", "--project-from-cwd", "--agent-interface", "tools"],
         cwd=str(repo),
         env=env,
     )
@@ -115,7 +114,7 @@ def test_shared_server_cannot_switch_projects(repo, env):
     async def scenario():
         params = StdioServerParameters(
             command=SHIM,
-            args=["start-mcp-server", "--context=codex", "--project-from-cwd", "--agent-interface", "tools", "--enable-web-dashboard", "false"],
+            args=["start-mcp-server", "--context=codex", "--project-from-cwd", "--agent-interface", "tools"],
             cwd=str(repo),
             env=env,
         )
@@ -174,3 +173,43 @@ def test_server_listens_only_on_private_unix_socket(repo, env):
     assert tcp == ""
     assert socket_dir.stat().st_mode & 0o777 == 0o700
     assert Path(env["SERENA_SHARED_STATE_DIR"]).stat().st_mode & 0o777 == 0o700
+
+
+INITIALIZE = json.dumps({
+    "jsonrpc": "2.0", "id": 1, "method": "initialize",
+    "params": {"protocolVersion": "2025-06-18", "capabilities": {},
+               "clientInfo": {"name": "raw", "version": "0"}},
+}) + "\n"
+
+
+def start_raw_client(repo, env) -> subprocess.Popen:
+    """A client that, unlike the SDK's, never escalates to SIGKILL on its own."""
+    proc = subprocess.Popen(
+        [SHIM, "start-mcp-server", "--context=codex", "--project-from-cwd", "--agent-interface", "tools"],
+        cwd=repo, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+    )
+    proc.stdin.write(INITIALIZE)
+    proc.stdin.flush()
+    assert '"result"' in proc.stdout.readline()  # attached and initialized
+    return proc
+
+
+def lease_count(env) -> int:
+    return len(list(Path(env["SERENA_SHARED_STATE_DIR"]).glob("*/leases/*")))
+
+
+@pytest.mark.parametrize("how", ["stdin_eof", "sigterm_with_stdin_open"])
+def test_relay_exits_and_releases_its_lease(repo, env, how):
+    import signal
+
+    proc = start_raw_client(repo, env)
+    assert lease_count(env) == 1
+    if how == "stdin_eof":
+        proc.stdin.close()
+    else:
+        proc.send_signal(signal.SIGTERM)
+    assert proc.wait(timeout=15) is not None
+    deadline = time.monotonic() + 30
+    while servers(env) and time.monotonic() < deadline:  # idle timeout is 3 s
+        time.sleep(1)
+    assert servers(env) == []

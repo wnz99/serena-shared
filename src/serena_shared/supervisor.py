@@ -7,6 +7,7 @@ has been alive for `idle_seconds`.
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import signal
@@ -14,12 +15,14 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from typing import IO
 
 from serena_shared.core import ServerState, kill_group, socket_ready
 
 POLL_SECONDS = 5
 START_TIMEOUT_SECONDS = 180
 STOP_GRACE_SECONDS = 10
+MAX_LOG_BYTES = 5 * 1024 * 1024
 
 
 def _stop(child: subprocess.Popen) -> None:
@@ -34,7 +37,15 @@ def _stop(child: subprocess.Popen) -> None:
     child.poll()
 
 
-def _start(state: ServerState, spec: dict) -> subprocess.Popen | None:
+def _rotate_log(state: ServerState) -> None:
+    try:
+        if state.log_file.stat().st_size > MAX_LOG_BYTES:
+            os.replace(state.log_file, state.log_file.with_suffix(".log.1"))
+    except FileNotFoundError:
+        pass
+
+
+def _start(state: ServerState, spec: dict, server_lock_fd: int) -> subprocess.Popen | None:
     state.socket.unlink(missing_ok=True)  # left by a server that was killed
     with open(state.log_file, "ab") as log:
         child = subprocess.Popen(
@@ -44,6 +55,7 @@ def _start(state: ServerState, spec: dict) -> subprocess.Popen | None:
             stdout=log,
             stderr=log,
             start_new_session=True,
+            pass_fds=(server_lock_fd,),  # Serena keeps server.lock held if we die first
         )
     deadline = time.monotonic() + START_TIMEOUT_SECONDS
     while child.poll() is None and time.monotonic() < deadline:
@@ -54,7 +66,7 @@ def _start(state: ServerState, spec: dict) -> subprocess.Popen | None:
     return None
 
 
-def run(state: ServerState) -> int:
+def run(state: ServerState, server_lock: IO[str]) -> int:
     spec = json.loads(state.spec_file.read_text())
     me = os.getpid()
     child: subprocess.Popen | None = None
@@ -62,16 +74,21 @@ def run(state: ServerState) -> int:
     def on_signal(signum, _frame):
         if child is not None:
             _stop(child)
+        # Safe without `lock`: no other supervisor can start while we hold our locks.
+        state.remove_record_if_owned(me)
+        state.socket.unlink(missing_ok=True)
         os._exit(128 + signum)
 
     signal.signal(signal.SIGTERM, on_signal)
     signal.signal(signal.SIGINT, on_signal)
     signal.signal(signal.SIGHUP, signal.SIG_IGN)
 
-    # The client that started us holds the lock and is waiting on this record.
+    _rotate_log(state)
+    # The client that started us holds `lock` and is waiting on this record.
     state.write_json(state.server_file, {"state": "starting", "supervisor_pid": me})
-    child = _start(state, spec)
+    child = _start(state, spec, server_lock.fileno())
     if child is None:
+        state.remove_record_if_owned(me)
         return 1
     state.write_json(
         state.server_file,
@@ -107,11 +124,20 @@ def run(state: ServerState) -> int:
 
 def main() -> None:
     state = ServerState(Path(sys.argv[1]))
-    # Detach completely: the launching client reaps the intermediate process at once, so
-    # this supervisor never lingers as a zombie that still looks alive to other clients.
+    # Take both locks before detaching: the forked child shares the locked files, so they are
+    # already held when the launching client sees this process exit.
+    supervisor_lock = open(state.supervisor_lock, "a")
+    server_lock = open(state.server_lock, "a")
+    try:
+        fcntl.flock(supervisor_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(server_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        sys.exit(1)  # processes of a previous server for this key are still alive
+    # Detach completely: the launching client reaps this intermediate process at once, so
+    # the supervisor never lingers as a zombie under it.
     if os.fork():
         os._exit(0)
-    sys.exit(run(state))
+    sys.exit(run(state, server_lock))
 
 
 if __name__ == "__main__":

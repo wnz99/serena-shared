@@ -12,9 +12,10 @@ import shutil
 import signal
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
-from typing import IO
+from typing import IO, NoReturn
 
 import anyio
 import httpx2
@@ -27,11 +28,12 @@ from serena_shared.core import (
     HTTP_BASE,
     MAX_SOCKET_PATH,
     SERVE_UNIX,
+    NotShareable,
+    ServerRecord,
     ServerState,
     context_arg,
     find_project_root,
     is_shareable,
-    pid_alive,
     pinned_context,
     serena_python,
     server_args,
@@ -40,67 +42,87 @@ from serena_shared.core import (
 )
 
 DEFAULT_IDLE_SECONDS = 1800
-ATTACH_TIMEOUT_SECONDS = 600  # covers START_ATTEMPTS slow starts
+START_WAIT_SECONDS = 200  # per spawn; Serena's first start can index a large project
+EXIT_GRACE_SECONDS = 5
 
 
-def _fail(message: str) -> None:
+def _fail(message: str) -> NoReturn:
     warn(message)
     sys.exit(1)
 
 
 def _serena_executable() -> str:
-    found = os.environ.get("SERENA_SHARED_SERENA") or shutil.which("serena")
+    configured = os.environ.get("SERENA_SHARED_SERENA") or "serena"
+    found = shutil.which(configured)
     if not found:
-        _fail("cannot find `serena`; install it or set SERENA_SHARED_SERENA")
+        _fail(f"cannot find {configured!r}; install Serena or set SERENA_SHARED_SERENA")
     if os.path.realpath(found) == os.path.realpath(sys.argv[0]):
         _fail("`serena` resolves to serena-shared itself; set SERENA_SHARED_SERENA to the real Serena")
     return found
 
 
+def _idle_seconds() -> int:
+    raw = os.environ.get("SERENA_SHARED_IDLE_SECONDS", str(DEFAULT_IDLE_SECONDS))
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        _fail(f"SERENA_SHARED_IDLE_SECONDS must be a whole number of seconds, not {raw!r}")
+
+
 def _spawn_supervisor(state: ServerState, command: list[str], root: Path) -> None:
     state.write_json(
         state.spec_file,
-        {
-            "command": command,
-            "root": str(root),
-            "idle_seconds": int(os.environ.get("SERENA_SHARED_IDLE_SECONDS", DEFAULT_IDLE_SECONDS)),
-        },
+        {"command": command, "root": str(root), "idle_seconds": _idle_seconds()},
     )
     with open(state.log_file, "ab") as log:
-        subprocess.run(  # returns once the supervisor has forked itself away
+        # Returns once the supervisor holds its liveness lock and has forked itself away.
+        subprocess.run(
             [sys.executable, "-m", "serena_shared.supervisor", str(state.dir)],
             cwd=root,
             stdin=subprocess.DEVNULL,
             stdout=log,
             stderr=log,
             start_new_session=True,
-            check=True,
         )
+
+
+def _wait_until_running(state: ServerState) -> ServerRecord | None:
+    """Wait for the live supervisor to publish a healthy server; None once it has died."""
+    deadline = time.monotonic() + START_WAIT_SECONDS
+    while time.monotonic() < deadline:
+        record = state.read_server()
+        if state.healthy(record):
+            return record
+        if not state.supervisor_alive():
+            return None
+        time.sleep(0.2)
+    return None
 
 
 def _attach(state: ServerState, command: list[str], root: Path) -> tuple[str, IO[str]]:
     """Return the socket of a healthy server for this key, starting one if needed, plus this
-    client's lease. The lease is taken while still holding the lock, so the server cannot be
-    reaped between attach and first request."""
-    deadline = time.monotonic() + ATTACH_TIMEOUT_SECONDS
+    client's lease. Runs under `lock`, and takes the lease before releasing it, so the
+    server cannot be reaped between attach and first request."""
     with state.locked():
-        spawned = False
-        while True:
-            record = state.read_server()
-            if state.healthy(record):
-                return record["socket"], state.take_lease()
-            starting = record and record.get("state") == "starting" and pid_alive(record.get("supervisor_pid", 0))
-            if starting and time.monotonic() < deadline:
-                time.sleep(0.2)  # a supervisor (ours or one whose client died) is still starting
-                continue
-            if record:
-                state.discard(record)
-            if spawned:
-                _fail(f"shared Serena server failed to start; see {state.log_file}")
+        record = state.read_server()
+        if not state.healthy(record) and record and record.get("state") == "starting":
+            record = _wait_until_running(state)  # its starting client died while waiting
+        if not state.healthy(record):
+            if record or state.server_alive():
+                state.discard(record or {})
             _spawn_supervisor(state, command, root)
-            spawned = True
-            while state.read_server() is None and time.monotonic() < deadline:
-                time.sleep(0.05)
+            record = _wait_until_running(state)
+            if record is None:
+                _fail(f"shared Serena server failed to start; see {state.log_file}")
+        return record["socket"], state.take_lease()
+
+
+def _exit_soon() -> None:
+    """Safety net after a signal: stdin's reader thread cannot be cancelled, so a client that
+    signals without closing stdin would otherwise keep this process (and its lease) alive."""
+    timer = threading.Timer(EXIT_GRACE_SECONDS, os._exit, args=(0,))
+    timer.daemon = True
+    timer.start()
 
 
 async def _relay(socket_path: str) -> None:
@@ -112,27 +134,29 @@ async def _relay(socket_path: str) -> None:
     protocol_version: str | None = None
 
     async def client_to_server(source, sink) -> None:
-        async for item in source:
-            if isinstance(item, Exception):
-                warn(f"ignoring unreadable client message: {item}")
-                continue
-            metadata = (
-                ClientMessageMetadata(headers={MCP_PROTOCOL_VERSION_HEADER: protocol_version})
-                if protocol_version
-                else None
-            )
-            await sink.send(SessionMessage(item.message, metadata=metadata))
+        async with sink:  # closing ends the HTTP session
+            async for item in source:
+                if isinstance(item, Exception):
+                    warn(f"ignoring unreadable client message: {item}")
+                    continue
+                metadata = (
+                    ClientMessageMetadata(headers={MCP_PROTOCOL_VERSION_HEADER: protocol_version})
+                    if protocol_version
+                    else None
+                )
+                await sink.send(SessionMessage(item.message, metadata=metadata))
 
     async def server_to_client(source, sink) -> None:
         nonlocal protocol_version
-        async for item in source:
-            if isinstance(item, Exception):
-                raise item
-            message = getattr(item.message, "root", item.message)
-            result = getattr(message, "result", None)
-            if isinstance(result, dict) and isinstance(result.get("protocolVersion"), str):
-                protocol_version = result["protocolVersion"]  # the initialize response
-            await sink.send(SessionMessage(item.message))
+        async with sink:  # closing lets stdio_server finish and the process exit
+            async for item in source:
+                if isinstance(item, Exception):
+                    raise item
+                message = getattr(item.message, "root", item.message)
+                result = getattr(message, "result", None)
+                if isinstance(result, dict) and isinstance(result.get("protocolVersion"), str):
+                    protocol_version = result["protocolVersion"]  # the initialize response
+                await sink.send(SessionMessage(item.message))
 
     async with (
         http,
@@ -146,8 +170,9 @@ async def _relay(socket_path: str) -> None:
             tasks.cancel_scope.cancel()
 
         async def stop_on_signal() -> None:
-            with anyio.open_signal_receiver(signal.SIGTERM, signal.SIGHUP) as signals:
+            with anyio.open_signal_receiver(signal.SIGTERM, signal.SIGHUP, signal.SIGINT) as signals:
                 async for _ in signals:
+                    _exit_soon()
                     tasks.cancel_scope.cancel()  # still closes the HTTP session cleanly
 
         tasks.start_soon(run_then_stop, client_to_server(client_read, server_write))
@@ -159,16 +184,18 @@ def main() -> None:
     args = sys.argv[1:]
     serena = _serena_executable()
     root = find_project_root(Path.cwd()) if is_shareable(args) else None
-    python = serena_python(serena) if root else None
-    context_file = pinned_context(python, context_arg(args)) if python else None
-    if root is None or python is None or context_file is None:
+    if root is None:
+        os.execv(serena, [serena, *args])
+    try:
+        python = serena_python(serena)
+        rewritten = server_args(args, root, pinned_context(python, context_arg(args)))
+        state = ServerState.for_key(server_key(serena, rewritten))
+        if len(os.fsencode(state.socket)) > MAX_SOCKET_PATH:
+            raise NotShareable(f"socket path too long ({state.socket}); set a shorter SERENA_SHARED_STATE_DIR")
+    except NotShareable as exc:
+        warn(f"not sharing, running a private Serena: {exc}")
         os.execv(serena, [serena, *args])
 
-    rewritten = server_args(args, root, context_file)
-    state = ServerState.for_key(server_key(serena, rewritten))
-    if len(str(state.socket)) > MAX_SOCKET_PATH:
-        warn(f"not sharing: socket path too long ({state.socket}); set a shorter SERENA_SHARED_STATE_DIR")
-        os.execv(serena, [serena, *args])
     command = [python, "-I", str(SERVE_UNIX), str(state.socket), *rewritten]
     socket_path, lease = _attach(state, command, root)
     with lease:

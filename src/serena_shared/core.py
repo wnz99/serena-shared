@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import contextlib
-import errno
 import fcntl
 import hashlib
 import json
@@ -11,9 +10,11 @@ import os
 import secrets
 import signal
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
+import time
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -24,12 +25,20 @@ from typing import IO, TypedDict
 HOST = "127.0.0.1"
 HTTP_BASE = f"http://{HOST}:1"
 SERVE_UNIX = Path(__file__).with_name("serve_unix.py")
-MAX_SOCKET_PATH = 100  # AF_UNIX path limit: 104 bytes on macOS, 108 on Linux
+MAX_SOCKET_PATH = 100  # bytes; AF_UNIX allows 104 on macOS, 108 on Linux
 DEFAULT_CONTEXT = "desktop-app"  # Serena's own default
 
 # Serena options the shim owns; client-supplied values are dropped.
-_OWNED_FLAGS = {"--transport", "--host", "--port", "--project", "--project-file", "--context"}
+_OWNED_FLAGS = {
+    "--transport", "--host", "--port", "--project", "--project-file", "--context",
+    # A background shared server must not open a dashboard port or a browser tab.
+    "--enable-web-dashboard", "--open-web-dashboard",
+}
 _OWNED_SWITCHES = {"--project-from-cwd"}
+
+
+class NotShareable(Exception):
+    """Sharing is unavailable; the reason is the message. The caller runs plain Serena."""
 
 
 def warn(message: str) -> None:
@@ -93,29 +102,29 @@ def atomic_write(path: Path, text: str) -> None:
         raise
 
 
-def serena_python(serena: str) -> str | None:
-    """Serena's interpreter, from its launcher's shebang. None, with a reason on stderr,
-    when the launcher is not a Python script with a direct interpreter path."""
+def serena_python(serena: str) -> str:
+    """Serena's interpreter, from its launcher's shebang."""
     try:
         with open(os.path.realpath(serena), "rb") as f:
             shebang = f.readline().decode().strip()
     except (OSError, UnicodeDecodeError) as exc:
-        warn(f"not sharing: cannot read {serena}: {exc}")
-        return None
-    if not shebang.startswith("#!/") or " " in shebang:
-        warn(f"not sharing: {serena} has no direct interpreter shebang")
-        return None
-    return shebang[2:]
+        raise NotShareable(f"cannot read {serena}: {exc}") from exc
+    interpreter = shebang[2:]
+    if (
+        not shebang.startswith("#!/")
+        or " " in interpreter
+        or not os.path.basename(interpreter).startswith("python")
+    ):
+        raise NotShareable(f"{serena} is not a Python launcher with a direct interpreter path")
+    return interpreter
 
 
-def pinned_context(python: str, context: str) -> Path | None:
+def pinned_context(python: str, context: str) -> Path:
     """Write a copy of `context` with `single_project: true`, which makes Serena drop
     `activate_project` from the exposed tools. A shared server must never switch projects:
     the switch would apply to every connected client.
 
-    Runs Serena's own interpreter so contexts resolve exactly as Serena resolves them.
-    Returns None, with a reason on stderr, when that is not possible; the caller then falls
-    back to a private stdio server."""
+    Runs Serena's own interpreter so contexts resolve exactly as Serena resolves them."""
     if context.endswith((".yml", ".yaml")):
         context = os.path.abspath(context)
     try:
@@ -124,13 +133,10 @@ def pinned_context(python: str, context: str) -> Path | None:
             capture_output=True, text=True, timeout=60, check=True, cwd=state_root(),
         )
     except subprocess.CalledProcessError as exc:
-        warn(f"not sharing: cannot load Serena context {context!r}: {exc.stderr.strip()[-300:]}")
-        return None
+        raise NotShareable(f"cannot load Serena context {context!r}: {exc.stderr.strip()[-300:]}") from exc
     except (OSError, subprocess.SubprocessError) as exc:
-        warn(f"not sharing: cannot run Serena's interpreter: {exc}")
-        return None
-    contexts = state_root() / "contexts"
-    contexts.mkdir(mode=0o700, exist_ok=True)
+        raise NotShareable(f"cannot run Serena's interpreter: {exc}") from exc
+    contexts = private_dir(state_root() / "contexts")
     target = contexts / f"{hashlib.sha256(result.stdout.encode()).hexdigest()[:20]}.yml"
     if not target.exists():  # content-addressed: concurrent writers write identical bytes
         atomic_write(target, result.stdout)
@@ -157,6 +163,8 @@ def server_args(args: Sequence[str], root: Path, context_file: Path) -> list[str
         "--project", str(root),
         "--transport", "streamable-http",
         "--host", HOST,
+        "--enable-web-dashboard", "false",
+        "--open-web-dashboard", "false",
     ]
     return out
 
@@ -169,29 +177,30 @@ def server_key(serena: str, args: Sequence[str]) -> str:
     return hashlib.sha256(material.encode()).hexdigest()[:20]
 
 
+def private_dir(path: Path) -> Path:
+    """Create `path` if needed and insist it is a real directory owned by us with mode 0700.
+    A directory someone else created (e.g. under /tmp) or a symlink is refused."""
+    with contextlib.suppress(FileExistsError):
+        path.mkdir(mode=0o700, parents=True)
+    info = os.lstat(path)
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
+        raise NotShareable(f"{path} is not a directory owned by the current user")
+    if stat.S_IMODE(info.st_mode) != 0o700:
+        os.chmod(path, 0o700)
+    return path
+
+
 def state_root() -> Path:
     base = os.environ.get("SERENA_SHARED_STATE_DIR") or os.path.join(
         os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"), "serena-shared"
     )
-    path = Path(base)
-    path.mkdir(mode=0o700, parents=True, exist_ok=True)
-    os.chmod(path, 0o700)
-    return path
-
-
-def pid_alive(pid: int) -> bool:
-    if pid <= 0:  # 0 and negatives address process groups, not a process
-        return False
-    try:
-        os.kill(pid, 0)
-    except OSError as exc:
-        return exc.errno == errno.EPERM
-    return True
+    return private_dir(Path(base))
 
 
 def kill_group(pid: int, sig: int) -> None:
-    with contextlib.suppress(ProcessLookupError, PermissionError):
-        os.killpg(pid, sig)
+    if pid > 0:  # 0 and negatives address other process groups
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            os.killpg(pid, sig)
 
 
 def socket_ready(path: str, timeout: float = 0.5) -> bool:
@@ -199,6 +208,25 @@ def socket_ready(path: str, timeout: float = 0.5) -> bool:
         sock.settimeout(timeout)
         sock.connect(path)
         return True
+    return False
+
+
+def is_locked(path: Path) -> bool:
+    """True when another open file description holds an flock on `path`."""
+    try:
+        # Writable (flock over NFS needs it) but never created: a probe must not resurrect
+        # a file someone just removed.
+        fd = os.open(path, os.O_WRONLY | os.O_APPEND)
+    except FileNotFoundError:
+        return False
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return True
+    except OSError:
+        return True  # cannot tell; assume held rather than reap a live holder
+    finally:
+        os.close(fd)
     return False
 
 
@@ -212,19 +240,24 @@ class ServerRecord(TypedDict, total=False):
 
 @dataclass(frozen=True)
 class ServerState:
-    """Files for one shared server: lock, spec, server.json, leases/, log.
+    """Files for one shared server: lock, supervisor.lock, server.lock, spec, server.json,
+    leases/, log.
 
-    Protocol: clients read and modify `server.json` only while holding the lock. The
-    supervisor writes it while the client that started it holds the lock and waits, and
-    deletes it only under the lock and only when the record names that supervisor."""
+    Protocol:
+    * Clients read and modify `server.json` only while holding `lock`. The supervisor writes
+      it while the client that started it holds `lock` and waits.
+    * The supervisor holds an flock on `supervisor.lock` for its whole life: a server is
+      healthy only while its supervisor (and so its idle reaper) is alive.
+    * The supervisor also locks `server.lock` and shares that open file with Serena, so it
+      stays held while any process of this server is alive. PIDs in `server.json` are trusted
+      for signalling only while it is held, which rules out signalling a reused PID."""
 
     dir: Path
 
     @classmethod
     def for_key(cls, key: str) -> ServerState:
-        state = cls(state_root() / key)
-        state.dir.mkdir(mode=0o700, exist_ok=True)
-        state.leases.mkdir(mode=0o700, exist_ok=True)
+        state = cls(private_dir(state_root() / key))
+        private_dir(state.leases)
         return state
 
     @property
@@ -242,6 +275,14 @@ class ServerState:
     @property
     def server_file(self) -> Path:
         return self.dir / "server.json"
+
+    @property
+    def supervisor_lock(self) -> Path:
+        return self.dir / "supervisor.lock"
+
+    @property
+    def server_lock(self) -> Path:
+        return self.dir / "server.lock"
 
     @property
     def log_file(self) -> Path:
@@ -265,22 +306,32 @@ class ServerState:
         except (OSError, ValueError):
             return None
 
+    def supervisor_alive(self) -> bool:
+        return is_locked(self.supervisor_lock)
+
+    def server_alive(self) -> bool:
+        """Any process of this server (supervisor, Serena) still running."""
+        return is_locked(self.server_lock)
+
     def healthy(self, record: ServerRecord | None) -> bool:
         return bool(
             record
             and record.get("state") == "running"
-            and pid_alive(record.get("supervisor_pid", 0))
-            and pid_alive(record.get("serena_pid", 0))
+            and self.supervisor_alive()
             and socket_ready(record.get("socket", ""))
         )
 
     def discard(self, record: ServerRecord) -> None:
-        """Stop whatever an unhealthy record still points at and remove it. Caller holds the lock."""
-        if pid_alive(record.get("supervisor_pid", 0) or 0):
-            with contextlib.suppress(ProcessLookupError, PermissionError):
-                os.kill(record["supervisor_pid"], signal.SIGTERM)
-        if record.get("serena_pid"):
-            kill_group(record["serena_pid"], signal.SIGKILL)
+        """Stop whatever an unhealthy record still points at and remove it. Caller holds `lock`."""
+        if self.server_alive():  # the PIDs still belong to this server
+            supervisor_pid = record.get("supervisor_pid", 0)
+            if supervisor_pid > 0:
+                with contextlib.suppress(ProcessLookupError, PermissionError):
+                    os.kill(supervisor_pid, signal.SIGTERM)
+            kill_group(record.get("serena_pid", 0), signal.SIGKILL)
+            deadline = time.monotonic() + 10
+            while self.server_alive() and time.monotonic() < deadline:
+                time.sleep(0.1)
         self.server_file.unlink(missing_ok=True)
 
     def remove_record_if_owned(self, supervisor_pid: int) -> None:
@@ -303,14 +354,8 @@ class ServerState:
         """Count leases still locked by a live client; remove the rest."""
         count = 0
         for lease in list(self.leases.iterdir()):
-            try:
-                with open(lease) as handle:
-                    try:
-                        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                    except BlockingIOError:
-                        count += 1
-                        continue
-                    lease.unlink(missing_ok=True)
-            except FileNotFoundError:
-                continue
+            if is_locked(lease):
+                count += 1
+            else:
+                lease.unlink(missing_ok=True)
         return count
