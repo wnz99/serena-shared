@@ -133,13 +133,12 @@ def test_discard_never_signals_a_reused_supervisor_pid(tmp_path, monkeypatch):
     state = ServerState.for_key("k")
     # Serena outlived a SIGKILLed supervisor (server.lock held), and the supervisor's PID now
     # belongs to an unrelated process.
-    holder = open(state.server_lock, "a")
-    fcntl.flock(holder, fcntl.LOCK_EX)
-    victim = subprocess.Popen(["sleep", "30"])
-    try:
-        with pytest.raises(NotShareable):
-            state.discard({"state": "running", "supervisor_pid": victim.pid, "serena_pid": 0})
-        assert victim.poll() is None
-    finally:
-        victim.kill()
-        holder.close()
+    with open(state.server_lock, "a") as holder:
+        fcntl.flock(holder, fcntl.LOCK_EX)
+        victim = subprocess.Popen(["sleep", "30"])
+        try:
+            with pytest.raises(NotShareable):
+                state.discard({"state": "running", "supervisor_pid": victim.pid, "serena_pid": 0})
+            assert victim.poll() is None
+        finally:
+            victim.kill()

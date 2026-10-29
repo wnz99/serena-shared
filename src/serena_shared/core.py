@@ -28,6 +28,8 @@ SERVE_UNIX = Path(__file__).with_name("serve_unix.py")
 MAX_SOCKET_PATH = 100  # bytes; AF_UNIX allows 104 on macOS, 108 on Linux
 DEFAULT_CONTEXT = "desktop-app"  # Serena's own default
 STOP_GRACE_SECONDS = 10
+DISCARD_STEP_SECONDS = 1.5  # discard runs while clients wait; keep it well under their timeouts
+MAX_LOG_BYTES = 5 * 1024 * 1024
 STRAY_LEASE_SECONDS = 60
 # Part of every server key: bump when the on-disk protocol changes, so servers started by an
 # older serena-shared keep their own state directory and idle out undisturbed.
@@ -209,6 +211,20 @@ def kill_group(pid: int, sig: int) -> None:
             os.killpg(pid, sig)
 
 
+def _signal(pid: int, sig: int) -> None:
+    with contextlib.suppress(ProcessLookupError, PermissionError):
+        os.kill(pid, sig)
+
+
+def _wait_for(condition, seconds: float) -> bool:
+    deadline = time.monotonic() + seconds
+    while not condition():
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.05)
+    return True
+
+
 def socket_ready(path: str, timeout: float = 0.5) -> bool:
     with contextlib.suppress(OSError), socket.socket(socket.AF_UNIX) as sock:
         sock.settimeout(timeout)
@@ -328,21 +344,31 @@ class ServerState:
         )
 
     def discard(self, record: ServerRecord) -> None:
-        """Stop whatever an unhealthy record still points at and remove it. Caller holds `lock`."""
-        # Each PID is signalled only while a lock proves it still belongs to this server:
-        # supervisor.lock is held only by the supervisor, server.lock also by Serena.
+        """Stop whatever an unhealthy record still points at and remove it. Caller holds `lock`.
+
+        Each PID is signalled only while a lock proves it still belongs to this server. The
+        supervisor goes first: once supervisor.lock is free, only Serena can still hold
+        server.lock, so Serena's PID cannot have been reaped and reused."""
         supervisor_pid = record.get("supervisor_pid", 0)
         if supervisor_pid > 0 and self.supervisor_alive():
-            with contextlib.suppress(ProcessLookupError, PermissionError):
-                os.kill(supervisor_pid, signal.SIGTERM)
-        if self.server_alive():
+            _signal(supervisor_pid, signal.SIGTERM)
+            if not _wait_for(lambda: not self.supervisor_alive(), DISCARD_STEP_SECONDS):
+                if self.supervisor_alive():
+                    _signal(supervisor_pid, signal.SIGKILL)
+                _wait_for(lambda: not self.supervisor_alive(), DISCARD_STEP_SECONDS)
+        if self.server_alive() and not self.supervisor_alive():
             kill_group(record.get("serena_pid", 0), signal.SIGKILL)
-        deadline = time.monotonic() + STOP_GRACE_SECONDS
-        while self.server_alive() and time.monotonic() < deadline:
-            time.sleep(0.1)
-        self.server_file.unlink(missing_ok=True)
+            _wait_for(lambda: not self.server_alive(), DISCARD_STEP_SECONDS)
         if self.server_alive():
+            # Keep the record: its PIDs are the only way a later attempt can stop these processes.
             raise NotShareable(f"processes of a previous server are still running; see {self.log_file}")
+        self.server_file.unlink(missing_ok=True)
+
+    def rotate_log(self) -> None:
+        """Called before a supervisor starts, while nothing has the log open for writing."""
+        with contextlib.suppress(FileNotFoundError):
+            if self.log_file.stat().st_size > MAX_LOG_BYTES:
+                os.replace(self.log_file, self.log_file.with_suffix(".log.1"))
 
     def remove_record_if_owned(self, supervisor_pid: int) -> None:
         record = self.read_server()

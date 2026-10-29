@@ -21,7 +21,6 @@ from serena_shared.core import STOP_GRACE_SECONDS, ServerState, kill_group, sock
 
 POLL_SECONDS = 5
 START_TIMEOUT_SECONDS = 180
-MAX_LOG_BYTES = 5 * 1024 * 1024
 
 
 def _stop(child: subprocess.Popen) -> None:
@@ -34,14 +33,6 @@ def _stop(child: subprocess.Popen) -> None:
             pass
     kill_group(child.pid, signal.SIGKILL)  # language servers that outlived Serena
     child.poll()
-
-
-def _rotate_log(state: ServerState) -> None:
-    try:
-        if state.log_file.stat().st_size > MAX_LOG_BYTES:
-            os.replace(state.log_file, state.log_file.with_suffix(".log.1"))
-    except FileNotFoundError:
-        pass
 
 
 def _launch(state: ServerState, spec: dict, server_lock_fd: int) -> subprocess.Popen:
@@ -86,7 +77,6 @@ def run(state: ServerState, server_lock: IO[str]) -> int:
     signal.signal(signal.SIGINT, on_signal)
     signal.signal(signal.SIGHUP, signal.SIG_IGN)
 
-    _rotate_log(state)
     # The client that started us holds `lock` and is waiting on this record. Serena's PID is
     # in it from the start, so a client can clean up even if we die during startup.
     stop_signals = {signal.SIGTERM, signal.SIGINT}

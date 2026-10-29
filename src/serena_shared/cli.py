@@ -7,6 +7,7 @@ on demand. Any other invocation is handed to `serena` unchanged.
 
 from __future__ import annotations
 
+import contextlib
 import os
 import shutil
 import signal
@@ -42,7 +43,11 @@ from serena_shared.core import (
 )
 
 DEFAULT_IDLE_SECONDS = 1800
-START_WAIT_SECONDS = 120  # Serena's socket opens after its agent and language backend start
+# How long a client waits, holding the lock, for a shared server to come up before it runs a
+# private Serena instead. MCP clients give a server about 10 s (Codex) to 30 s (Claude Code)
+# to start, and the private fallback needs time too. A slow server keeps starting in the
+# background and later sessions use it.
+START_WAIT_SECONDS = 6
 EXIT_GRACE_SECONDS = 5
 
 
@@ -70,6 +75,7 @@ def _idle_seconds() -> int:
 
 
 def _spawn_supervisor(state: ServerState, command: list[str], root: Path) -> None:
+    state.rotate_log()
     state.write_json(
         state.spec_file,
         {"command": command, "root": str(root), "idle_seconds": _idle_seconds()},
@@ -109,18 +115,23 @@ def _attach(state: ServerState, command: list[str], root: Path) -> tuple[str, IO
     Serena rather than leaving the client without one."""
     with state.locked():
         record = state.read_server()
-        if record and not state.healthy(record) and record.get("state") == "starting" and state.supervisor_alive():
+        starting = record is None or record.get("state") == "starting"
+        if not state.healthy(record) and starting and state.supervisor_alive():
             # Another client's start is still in progress (that client may have died waiting).
             record = _wait_until_running(state)
             if record is None and state.supervisor_alive():
                 raise NotShareable(f"the shared server is still starting; see {state.log_file}")
         if not state.healthy(record):
+            record = record or state.read_server()
             if record or state.server_alive():
                 state.discard(record or {})
             _spawn_supervisor(state, command, root)
             record = _wait_until_running(state)
             if record is None:
-                raise NotShareable(f"the shared server failed to start; see {state.log_file}")
+                if not state.supervisor_alive():  # it died (e.g. SIGKILL): don't leave Serena behind
+                    with contextlib.suppress(NotShareable):
+                        state.discard(state.read_server() or {})
+                raise NotShareable(f"the shared server did not start in time; see {state.log_file}")
         return record["socket"], state.take_lease()
 
 
@@ -187,12 +198,18 @@ async def _relay(socket_path: str) -> None:
         tasks.start_soon(stop_on_signal)
 
 
+def _run_serena(serena: str, args: list[str], reason: str | None = None) -> NoReturn:
+    if reason:
+        warn(f"not sharing, running a private Serena: {reason}")
+    os.execv(serena, [serena, *args])
+
+
 def main() -> None:
     args = sys.argv[1:]
     serena = _serena_executable()
     root = find_project_root(Path.cwd()) if is_shareable(args) else None
     if root is None:
-        os.execv(serena, [serena, *args])
+        _run_serena(serena, args)
     try:
         python = serena_python(serena)
         rewritten = server_args(args, root, pinned_context(python, context_arg(args)))
@@ -200,14 +217,12 @@ def main() -> None:
         if len(os.fsencode(state.socket)) > MAX_SOCKET_PATH:
             raise NotShareable(f"socket path too long ({state.socket}); set a shorter SERENA_SHARED_STATE_DIR")
     except NotShareable as exc:
-        warn(f"not sharing, running a private Serena: {exc}")
-        os.execv(serena, [serena, *args])
+        _run_serena(serena, args, str(exc))
 
     command = [python, "-I", str(SERVE_UNIX), str(state.socket), *rewritten]
     try:
         socket_path, lease = _attach(state, command, root)
     except NotShareable as exc:
-        warn(f"not sharing, running a private Serena: {exc}")
-        os.execv(serena, [serena, *args])
+        _run_serena(serena, args, str(exc))
     with lease:
         anyio.run(_relay, socket_path)

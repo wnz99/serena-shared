@@ -96,7 +96,8 @@ args = ["start-mcp-server", "--context=codex", "--project-from-cwd"]
 ```
 
 If you already have extra Serena arguments there (for example `--agent-interface tools`), keep
-them.
+them. Codex gives an MCP server 10 seconds to start by default. On a slow or busy machine you
+can allow more with `startup_timeout_sec = 30` in the same section.
 
 ### Other MCP clients
 
@@ -148,8 +149,10 @@ serena-shared; any values you pass for them are ignored.
 
 ## Upgrade
 
+Reinstall from the repository to get the latest version:
+
 ```sh
-uv tool upgrade serena-shared
+uv tool install --reinstall git+https://github.com/wnz99/serena-shared
 ```
 
 Then restart your agent sessions. Servers started by the previous version keep running for
@@ -185,8 +188,9 @@ Each session holds a lock while it is connected. When no session has been connec
 idle timeout, the server stops together with its language servers. If a server or its
 supervisor crashes, the next session start cleans it up and starts a fresh one.
 
-If a shared server cannot be started or reached, the session runs its own private Serena, as
-it would without serena-shared, and the reason is printed to stderr.
+If a shared server cannot be started or reached within a few seconds, the session runs its own
+private Serena, as it would without serena-shared, and the reason is printed to stderr. A
+server that is merely slow to start keeps starting in the background, and later sessions use it.
 
 Any other use of the command (for example `serena-shared --version`, or a configuration without
 `--project-from-cwd`) runs Serena directly, unchanged.

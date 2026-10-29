@@ -90,7 +90,7 @@ def test_concurrent_clients_share_one_server_until_idle(repo, env):
         time.sleep(1)
     assert servers(env) == []
     time.sleep(1)
-    assert subprocess.run(["ps", "-p", str(serena_pid)], capture_output=True).returncode != 0
+    assert subprocess.run(["ps", "-p", str(serena_pid)], capture_output=True, check=False).returncode != 0
 
 
 def test_contexts_get_separate_servers(repo, env):
@@ -131,7 +131,7 @@ def test_shared_server_cannot_switch_projects(repo, env):
 
 
 def process_gone(pid: int) -> bool:
-    return subprocess.run(["ps", "-p", str(pid)], capture_output=True).returncode != 0
+    return subprocess.run(["ps", "-p", str(pid)], capture_output=True, check=False).returncode != 0
 
 
 @pytest.mark.parametrize("victim", ["supervisor_pid", "serena_pid"])
@@ -162,10 +162,9 @@ def test_server_listens_only_on_private_unix_socket(repo, env):
                 while not servers(env):
                     await anyio.sleep(0.5)
             (record,) = servers(env)
-            tcp = subprocess.run(
-                ["lsof", "-a", "-iTCP", "-sTCP:LISTEN", "-p", str(record["serena_pid"])],
-                capture_output=True, text=True,
-            ).stdout
+            tcp = (await anyio.run_process(
+                ["lsof", "-a", "-iTCP", "-sTCP:LISTEN", "-p", str(record["serena_pid"])], check=False,
+            )).stdout.decode()
             socket_dir = Path(record["socket"]).parent
             release.set()
         return tcp, socket_dir
@@ -216,7 +215,8 @@ def test_relay_exits_and_releases_its_lease(repo, env, how):
     assert servers(env) == []
 
 
-def test_supervisor_signalled_during_startup_leaves_no_orphan(repo, env):
+@pytest.mark.parametrize("sig", ["SIGTERM", "SIGKILL"])
+def test_supervisor_signalled_during_startup_leaves_no_orphan(repo, env, sig):
     import signal
 
     state_dir = Path(env["SERENA_SHARED_STATE_DIR"])
@@ -234,7 +234,7 @@ def test_supervisor_signalled_during_startup_leaves_no_orphan(repo, env):
                     starting = record
         time.sleep(0.01)
     assert starting, "never saw a starting server"
-    os.kill(starting["supervisor_pid"], signal.SIGTERM)
+    os.kill(starting["supervisor_pid"], getattr(signal, sig))
 
     # The waiting client falls back to a private Serena and still works.
     first.stdin.write(INITIALIZE)
