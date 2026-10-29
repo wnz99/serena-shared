@@ -116,3 +116,22 @@ def test_supervisor_ignoring_sigterm_is_killed(state, fakes, listening_socket, m
     assert socket_path == listening_socket
     assert stuck.wait(timeout=5) == -signal.SIGKILL
     assert json.loads(state.server_file.read_text())["supervisor_pid"] != stuck.pid
+
+
+def test_late_lock_holder_skips_cleanup_instead_of_overrunning(state, fakes, monkeypatch):
+    fakes(state, "ignore-term")  # unhealthy record whose cleanup would take seconds
+    monkeypatch.setattr(cli, "_spawn_supervisor", lambda *_: pytest.fail("must not spawn this late"))
+    release = threading.Event()
+
+    def hold_lock():
+        with state.locked():
+            release.wait(cli.START_WAIT_SECONDS - 0.5)
+
+    holder = threading.Thread(target=hold_lock)
+    holder.start()
+    time.sleep(0.1)
+    started = time.monotonic()
+    with pytest.raises(NotShareable):
+        cli._attach(state, [], Path("/"))
+    holder.join()
+    assert time.monotonic() - started < cli.START_WAIT_SECONDS + 1

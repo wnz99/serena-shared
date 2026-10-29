@@ -26,6 +26,7 @@ from mcp.shared.inbound import MCP_PROTOCOL_VERSION_HEADER
 from mcp.shared.message import ClientMessageMetadata, SessionMessage
 
 from serena_shared.core import (
+    DISCARD_STEP_SECONDS,
     HTTP_BASE,
     MAX_SOCKET_PATH,
     SERVE_UNIX,
@@ -43,12 +44,13 @@ from serena_shared.core import (
 )
 
 DEFAULT_IDLE_SECONDS = 1800
-# How long a client waits, holding the lock, for a shared server to come up before it runs a
-# private Serena instead. MCP clients give a server about 10 s (Codex) to 30 s (Claude Code)
+# Total time a client spends getting a shared server (queueing for the lock, cleanup, waiting
+# for startup) before it runs a private Serena instead. MCP clients give a server about 10 s (Codex) to 30 s (Claude Code)
 # to start, and the private fallback needs time too. A slow server keeps starting in the
 # background and later sessions use it.
 START_WAIT_SECONDS = 6
 EXIT_GRACE_SECONDS = 5
+DISCARD_BUDGET_SECONDS = 3 * DISCARD_STEP_SECONDS + 1  # discard's worst case plus a spawn
 
 
 def _fail(message: str) -> NoReturn:
@@ -126,6 +128,10 @@ def _attach(state: ServerState, command: list[str], root: Path) -> tuple[str, IO
         if not state.healthy(record):
             record = record or state.read_server()
             if record or state.server_alive():
+                if deadline - time.monotonic() < DISCARD_BUDGET_SECONDS:
+                    # Too late to clean up within this client's startup budget; a later client
+                    # with a fresh budget will.
+                    raise NotShareable("a previous shared server is still being cleaned up")
                 state.discard(record or {})
             _spawn_supervisor(state, command, root)
             record = _wait_until_running(state, deadline)

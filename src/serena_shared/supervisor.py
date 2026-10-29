@@ -24,7 +24,11 @@ START_TIMEOUT_SECONDS = 180
 
 
 def _stop(child: subprocess.Popen) -> None:
-    """Serena runs in its own process group; stop it together with its language servers."""
+    """Serena runs in its own process group; stop it together with its language servers.
+    Runs once: a second group kill after Serena was reaped could hit a reused PID."""
+    if getattr(child, "_serena_shared_stopped", False):
+        return
+    child._serena_shared_stopped = True
     if child.poll() is None:
         kill_group(child.pid, signal.SIGTERM)
         try:
