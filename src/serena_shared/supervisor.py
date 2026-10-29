@@ -108,8 +108,8 @@ def run(state: ServerState, server_lock: IO[str]) -> int:
                 if state.live_leases():
                     idle_since = None
                     continue
+                _stop(child)  # before removing the record: its PIDs are needed if we die midway
                 state.remove_record_if_owned(me)
-                _stop(child)
             return 0
         with state.locked():
             state.remove_record_if_owned(me)

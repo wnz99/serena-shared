@@ -93,9 +93,8 @@ def _spawn_supervisor(state: ServerState, command: list[str], root: Path) -> Non
         )
 
 
-def _wait_until_running(state: ServerState) -> ServerRecord | None:
+def _wait_until_running(state: ServerState, deadline: float) -> ServerRecord | None:
     """Wait for the live supervisor to publish a healthy server; None once it has died."""
-    deadline = time.monotonic() + START_WAIT_SECONDS
     while time.monotonic() < deadline:
         record = state.read_server()
         if state.healthy(record):
@@ -113,12 +112,15 @@ def _attach(state: ServerState, command: list[str], root: Path) -> tuple[str, IO
 
     Raises NotShareable when no shared server can be had; the caller then runs a private
     Serena rather than leaving the client without one."""
-    with state.locked():
+    # One deadline per client covers queueing for the lock, cleanup and waiting, so clients
+    # arriving together never add their waits up.
+    deadline = time.monotonic() + START_WAIT_SECONDS
+    with state.locked(deadline):
         record = state.read_server()
         starting = record is None or record.get("state") == "starting"
         if not state.healthy(record) and starting and state.supervisor_alive():
             # Another client's start is still in progress (that client may have died waiting).
-            record = _wait_until_running(state)
+            record = _wait_until_running(state, deadline)
             if record is None and state.supervisor_alive():
                 raise NotShareable(f"the shared server is still starting; see {state.log_file}")
         if not state.healthy(record):
@@ -126,7 +128,7 @@ def _attach(state: ServerState, command: list[str], root: Path) -> tuple[str, IO
             if record or state.server_alive():
                 state.discard(record or {})
             _spawn_supervisor(state, command, root)
-            record = _wait_until_running(state)
+            record = _wait_until_running(state, deadline)
             if record is None:
                 if not state.supervisor_alive():  # it died (e.g. SIGKILL): don't leave Serena behind
                     with contextlib.suppress(NotShareable):

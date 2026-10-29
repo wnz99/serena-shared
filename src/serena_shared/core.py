@@ -31,9 +31,10 @@ STOP_GRACE_SECONDS = 10
 DISCARD_STEP_SECONDS = 1.5  # discard runs while clients wait; keep it well under their timeouts
 MAX_LOG_BYTES = 5 * 1024 * 1024
 STRAY_LEASE_SECONDS = 60
-# Part of every server key: bump when the on-disk protocol changes, so servers started by an
-# older serena-shared keep their own state directory and idle out undisturbed.
-STATE_VERSION = 2
+# Part of every server key: bump on any change to the on-disk protocol or supervisor
+# behaviour, so servers started by an older serena-shared keep their own state directory,
+# serve only their existing sessions and idle out undisturbed.
+STATE_VERSION = 3
 
 # Serena options the shim owns; client-supplied values are dropped.
 _OWNED_FLAGS = {
@@ -311,9 +312,21 @@ class ServerState:
         return self.dir / "server.log"
 
     @contextlib.contextmanager
-    def locked(self) -> Iterator[None]:
+    def locked(self, deadline: float | None = None) -> Iterator[None]:
+        """Hold `lock`. With a `time.monotonic()` deadline, raise NotShareable once it passes
+        instead of queueing behind other clients indefinitely."""
         with open(self.dir / "lock", "a") as handle:
-            fcntl.flock(handle, fcntl.LOCK_EX)
+            if deadline is None:
+                fcntl.flock(handle, fcntl.LOCK_EX)
+            else:
+                while True:
+                    try:
+                        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        break
+                    except BlockingIOError:
+                        if time.monotonic() >= deadline:
+                            raise NotShareable("another session is still setting up the shared server") from None
+                        time.sleep(0.05)
             try:
                 yield
             finally:
@@ -347,8 +360,10 @@ class ServerState:
         """Stop whatever an unhealthy record still points at and remove it. Caller holds `lock`.
 
         Each PID is signalled only while a lock proves it still belongs to this server. The
-        supervisor goes first: once supervisor.lock is free, only Serena can still hold
-        server.lock, so Serena's PID cannot have been reaped and reused."""
+        supervisor goes first; once supervisor.lock is free, a held server.lock means Serena
+        (which inherited it) is alive, so its process group still exists and cannot have been
+        reused. Language servers do not inherit server.lock: if Serena has already exited they
+        are not detected here; Serena and the supervisor normally stop them."""
         supervisor_pid = record.get("supervisor_pid", 0)
         if supervisor_pid > 0 and self.supervisor_alive():
             _signal(supervisor_pid, signal.SIGTERM)
