@@ -23,10 +23,27 @@ SHIM = str(Path(sys.executable).with_name("serena-shared"))
 NO_DASHBOARD = ("--enable-web-dashboard", "false", "--open-web-dashboard", "false")
 
 
+@pytest.fixture(autouse=True)
+def cold_backend_budget(tmp_path, monkeypatch):
+    # Protocol/sharing tests must wait for cold language servers on loaded machines.
+    # test_attach.py separately checks the production six-second fallback budget.
+    launcher = tmp_path / "serena-shared"
+    launcher.write_text(
+        f"#!{sys.executable}\n"
+        "from serena_shared import cli\n"
+        "cli.START_WAIT_SECONDS = 180\n"
+        "cli.main()\n"
+    )
+    launcher.chmod(0o700)
+    monkeypatch.setattr(sys.modules[__name__], "SHIM", str(launcher))
+
+
 @pytest.fixture
 def repo(tmp_path):
     repo = tmp_path / "repo"
     repo.mkdir()
+    (repo / ".serena").mkdir()
+    (repo / ".serena" / "project.yml").write_text("project_name: fixture\nlanguages: [python]\n")
     (repo / "app.py").write_text("def greet(name):\n    return f'hi {name}'\n")
     subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
     return repo

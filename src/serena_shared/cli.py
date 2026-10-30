@@ -10,24 +10,15 @@ from __future__ import annotations
 import contextlib
 import os
 import shutil
-import signal
 import subprocess
 import sys
-import threading
 import time
 from pathlib import Path
 from typing import IO, NoReturn
 
-import anyio
-import httpx2
-from mcp.client.streamable_http import streamable_http_client
-from mcp.server.stdio import stdio_server
-from mcp.shared.inbound import MCP_PROTOCOL_VERSION_HEADER
-from mcp.shared.message import ClientMessageMetadata, SessionMessage
 
 from serena_shared.core import (
     DISCARD_STEP_SECONDS,
-    HTTP_BASE,
     MAX_SOCKET_PATH,
     SERVE_UNIX,
     NotShareable,
@@ -49,7 +40,6 @@ DEFAULT_IDLE_SECONDS = 1800
 # to start, and the private fallback needs time too. A slow server keeps starting in the
 # background and later sessions use it.
 START_WAIT_SECONDS = 6
-EXIT_GRACE_SECONDS = 5
 DISCARD_BUDGET_SECONDS = 3 * DISCARD_STEP_SECONDS + 1  # discard's worst case plus a spawn
 
 
@@ -143,69 +133,6 @@ def _attach(state: ServerState, command: list[str], root: Path) -> tuple[str, IO
         return record["socket"], state.take_lease()
 
 
-def _exit_soon() -> None:
-    """Safety net after a signal: stdin's reader thread cannot be cancelled, so a client that
-    signals without closing stdin would otherwise keep this process (and its lease) alive."""
-    timer = threading.Timer(EXIT_GRACE_SECONDS, os._exit, args=(0,))
-    timer.daemon = True
-    timer.start()
-
-
-async def _relay(socket_path: str) -> None:
-    # Tool calls can legitimately run longer than any read timeout.
-    http = httpx2.AsyncClient(
-        transport=httpx2.AsyncHTTPTransport(uds=socket_path),
-        timeout=httpx2.Timeout(30.0, read=None),
-    )
-    protocol_version: str | None = None
-
-    async def client_to_server(source, sink) -> None:
-        async with sink:  # closing ends the HTTP session
-            async for item in source:
-                if isinstance(item, Exception):
-                    warn(f"ignoring unreadable client message: {item}")
-                    continue
-                metadata = (
-                    ClientMessageMetadata(headers={MCP_PROTOCOL_VERSION_HEADER: protocol_version})
-                    if protocol_version
-                    else None
-                )
-                await sink.send(SessionMessage(item.message, metadata=metadata))
-
-    async def server_to_client(source, sink) -> None:
-        nonlocal protocol_version
-        async with sink:  # closing lets stdio_server finish and the process exit
-            async for item in source:
-                if isinstance(item, Exception):
-                    raise item
-                message = getattr(item.message, "root", item.message)
-                result = getattr(message, "result", None)
-                if isinstance(result, dict) and isinstance(result.get("protocolVersion"), str):
-                    protocol_version = result["protocolVersion"]  # the initialize response
-                await sink.send(SessionMessage(item.message))
-
-    async with (
-        http,
-        stdio_server() as (client_read, client_write),
-        streamable_http_client(f"{HTTP_BASE}/mcp", http_client=http) as (server_read, server_write),
-        anyio.create_task_group() as tasks,
-    ):
-
-        async def run_then_stop(coro) -> None:
-            await coro
-            tasks.cancel_scope.cancel()
-
-        async def stop_on_signal() -> None:
-            with anyio.open_signal_receiver(signal.SIGTERM, signal.SIGHUP, signal.SIGINT) as signals:
-                async for _ in signals:
-                    _exit_soon()
-                    tasks.cancel_scope.cancel()  # still closes the HTTP session cleanly
-
-        tasks.start_soon(run_then_stop, client_to_server(client_read, server_write))
-        tasks.start_soon(run_then_stop, server_to_client(server_read, client_write))
-        tasks.start_soon(stop_on_signal)
-
-
 def _run_serena(serena: str, args: list[str], reason: str | None = None) -> NoReturn:
     if reason:
         warn(f"not sharing, running a private Serena: {reason}")
@@ -233,4 +160,6 @@ def main() -> None:
     except NotShareable as exc:
         _run_serena(serena, args, str(exc))
     with lease:
-        anyio.run(_relay, socket_path)
+        from serena_shared.relay import run_relay
+
+        run_relay(socket_path)

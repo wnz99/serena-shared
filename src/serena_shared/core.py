@@ -86,15 +86,33 @@ def context_arg(args: Sequence[str]) -> str:
 
 
 _PIN_CONTEXT = """
-import sys, yaml
+import json, os, site, sys, yaml
+from pathlib import Path
+from serena.config import context_mode, serena_config
+from serena import constants
 from serena.config.context_mode import SerenaAgentContext
 context = SerenaAgentContext.load(sys.argv[1])
 path = context._yaml_path or SerenaAgentContext.get_path(context.name)
+dependencies = [str(Path(path).absolute()), context_mode.__file__, serena_config.__file__, constants.__file__,
+                str(Path(serena_config.SerenaPaths().user_contexts_dir).absolute() / (context.name + ".yml"))]
+for directory in site.getsitepackages():
+    dependencies.append(directory)
+    dependencies.extend(str(p) for p in Path(directory).glob("*.pth"))
+dependencies.append(str(Path(sys.prefix) / "pyvenv.cfg"))
+def fingerprint(path):
+    try:
+        s = os.stat(path)
+        return [s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns, s.st_ctime_ns]
+    except FileNotFoundError:
+        return None
+before = {p: fingerprint(p) for p in dependencies}
 with open(path, encoding="utf-8") as f:
     data = yaml.safe_load(f)
 data["name"] = context.name
 data["single_project"] = True
-sys.stdout.write(yaml.safe_dump(data, sort_keys=False, allow_unicode=True))
+if before != {p: fingerprint(p) for p in dependencies}:
+    raise RuntimeError("Serena context changed while it was being pinned")
+sys.stdout.write(json.dumps({"text": yaml.safe_dump(data, sort_keys=False, allow_unicode=True), "dependencies": before}))
 """
 
 
@@ -142,14 +160,48 @@ def serena_python(serena: str) -> str:
     return interpreter
 
 
+def _fingerprint(path: str) -> list[int] | None:
+    try:
+        info = os.stat(path)
+        return [info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns]
+    except FileNotFoundError:
+        return None
+
+
+def _cached_context(cache: Path, contexts: Path) -> Path | None:
+    try:
+        entry = json.loads(cache.read_text())
+        name = entry["target"]
+        if not isinstance(name, str) or not re.fullmatch(r"[0-9a-f]{20}\.yml", name):
+            return None
+        dependencies = entry["dependencies"]
+        if not isinstance(dependencies, dict) or not dependencies:
+            return None
+        if any(_fingerprint(path) != stamp for path, stamp in dependencies.items()):
+            return None
+        target = contexts / name
+        if hashlib.sha256(target.read_bytes()).hexdigest()[:20] != name[:-4]:
+            return None
+        return target
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
 def pinned_context(python: str, context: str) -> Path:
     """Write a copy of `context` with `single_project: true`, which makes Serena drop
     `activate_project` from the exposed tools. A shared server must never switch projects:
     the switch would apply to every connected client.
 
-    Runs Serena's own interpreter so contexts resolve exactly as Serena resolves them."""
-    if context.endswith((".yml", ".yaml")):
+    Runs Serena's own interpreter so contexts resolve exactly as Serena resolves them.
+    Reuse its result while the source, resolver, interpreter and override remain unchanged."""
+    if os.sep in context or (os.altsep and os.altsep in context) or context.lower().endswith((".yml", ".yaml")):
         context = os.path.abspath(context)
+    contexts = private_dir(state_root() / "contexts")
+    identity = json.dumps([python, os.path.realpath(python), _fingerprint(python), context,
+                           os.environ.get("SERENA_HOME", ""), str(Path.home()), _PIN_CONTEXT])
+    cache = contexts / f"request-{hashlib.sha256(identity.encode()).hexdigest()[:20]}.json"
+    if cached := _cached_context(cache, contexts):
+        return cached
     try:
         result = subprocess.run(
             [python, "-I", "-c", _PIN_CONTEXT, context],
@@ -159,10 +211,20 @@ def pinned_context(python: str, context: str) -> Path:
         raise NotShareable(f"cannot load Serena context {context!r}: {exc.stderr.strip()[-300:]}") from exc
     except (OSError, subprocess.SubprocessError) as exc:
         raise NotShareable(f"cannot run Serena's interpreter: {exc}") from exc
-    contexts = private_dir(state_root() / "contexts")
-    target = contexts / f"{hashlib.sha256(result.stdout.encode()).hexdigest()[:20]}.yml"
-    if not target.exists():  # content-addressed: concurrent writers write identical bytes
-        atomic_write(target, result.stdout)
+    try:
+        payload = json.loads(result.stdout)
+        text = payload["text"]
+        dependencies = payload["dependencies"]
+        if not isinstance(text, str) or not isinstance(dependencies, dict) or not dependencies:
+            raise ValueError("invalid context metadata")
+    except (ValueError, KeyError, TypeError) as exc:
+        raise NotShareable("Serena returned invalid pinned context metadata") from exc
+    target = contexts / f"{hashlib.sha256(text.encode()).hexdigest()[:20]}.yml"
+    if not target.exists() or target.read_bytes() != text.encode():
+        atomic_write(target, text)
+    # A concurrent edit after the subprocess read must invalidate the next request too.
+    if all(_fingerprint(path) == stamp for path, stamp in dependencies.items()):
+        atomic_write(cache, json.dumps({"target": target.name, "dependencies": dependencies}))
     return target
 
 
