@@ -1,11 +1,11 @@
 [project]
 name = "serena-shared"
-version = "0.2.1"
+version = "0.2.2"
 description = "Share one Serena MCP server per repository across concurrent Claude Code, Codex and other MCP clients."
 readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"
-dependencies = ["mcp>=2.2,<3", "anyio>=4", "httpx2>=2.5"]
+dependencies = ["anyio>=4", "httpx2>=2.5"]
 classifiers = [
   "Operating System :: POSIX :: Linux",
   "Operating System :: MacOS",
@@ -15,7 +15,7 @@ classifiers = [
 serena-shared = "serena_shared.cli:main"
 
 [dependency-groups]
-dev = ["pytest>=8"]
+dev = ["pytest>=8", "mcp>=2.2,<3"]
 
 [build-system]
 requires = ["hatchling"]
