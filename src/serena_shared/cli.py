@@ -132,9 +132,7 @@ def _attach(state: ServerState, command: list[str], root: Path) -> tuple[str, IO
         return record["socket"], state.take_lease()
 
 
-def _run_serena(serena: str, args: list[str], reason: str | None = None) -> NoReturn:
-    if reason:
-        warn(f"not sharing, running a private Serena: {reason}")
+def _run_serena(serena: str, args: list[str]) -> NoReturn:
     os.execv(serena, [serena, *args])
 
 

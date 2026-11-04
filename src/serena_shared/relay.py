@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import contextlib
 import json
-import sys
 import time
 from collections.abc import AsyncIterator
 
@@ -38,12 +37,11 @@ async def sse_messages(response: httpx2.Response) -> AsyncIterator[tuple[str, st
 
 
 class Relay:
-    def __init__(self, http: httpx2.AsyncClient, send=None):
+    def __init__(self, http: httpx2.AsyncClient, send):
         self.http = http
         self.session_id: str | None = None
         self.protocol: str | None = None
         self.initialize_id = _NO_ID
-        self.initialized = anyio.Event()
         self.writing = anyio.Lock()
         self.listening = False
         self.send = send
@@ -71,7 +69,6 @@ class Relay:
             self.initialize_result = result
             if isinstance(result, dict) and isinstance(result.get("protocolVersion"), str):
                 self.protocol = result["protocolVersion"]
-            self.initialized.set()
             if self.replaying:
                 if "error" in message:
                     raise RuntimeError("Serena rejected session reinitialization")
@@ -79,17 +76,8 @@ class Relay:
         if "method" in message and "id" in message:
             self.server_requests.add(message['id'])
         async with self.writing:
-            if self.send is not None:
-                await self.send(json.dumps(message, separators=(",", ":")) + "\n")
-            else:
-                await anyio.to_thread.run_sync(self.write_line, data)
+            await self.send(json.dumps(message, separators=(",", ":")) + "\n")
         return message
-
-    @staticmethod
-    def write_line(data: str) -> None:
-        # Multiline SSE data is one newline-delimited stdio message.
-        sys.stdout.write(json.dumps(json.loads(data), separators=(",", ":")) + "\n")
-        sys.stdout.flush()
 
     async def read_response(self, response: httpx2.Response, request_id=_NO_ID) -> tuple[bool, str | None]:
         last_event_id = None
