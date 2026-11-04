@@ -127,8 +127,8 @@ they restart.
 
 3. For Claude Code, `claude mcp get serena` should show `Status: ✔ Connected`.
 
-If a session falls back to a private Serena, serena-shared prints the reason to stderr, which
-your agent shows in its MCP logs.
+Shared startup failures are reported to the client instead of launching a private Serena.
+Rootless folders and invocations without `--project-from-cwd` still pass through to Serena.
 
 ## Settings
 
@@ -183,15 +183,27 @@ When an agent starts `serena-shared start-mcp-server --project-from-cwd ...`, se
 3. Connects to the running server for this repository, Serena installation and set of
    arguments, or starts one. Different contexts, such as `claude-code` and `codex`, get
    separate servers so each client gets its own tool set.
-4. Relays messages between the agent (over stdin/stdout, as before) and the server.
+4. Connects stdin/stdout to a shared relay broker for that server key. On macOS,
+   the client becomes the system `nc` process; Linux and systems without Apple's
+   `nc` use a standard-library Python byte proxy. The HTTP/async runtime runs once
+   per broker, rather than once per connected agent session.
 
-Each session holds a lock while it is connected. When no session has been connected for the
-idle timeout, the server stops together with its language servers. If a server or its
+Each active session holds a worker lease. After five minutes without client requests,
+the broker closes an initialized session and releases its lease. A later request
+reattaches to the worker and repeats initialization internally, without replaying tool
+calls or exposing a second initialization response. Sessions with in-flight work,
+unanswered server requests, resource subscriptions or custom logging settings remain
+attached. Initialization capabilities must match after reconnect; otherwise the client
+receives an error and must restart. Server notifications are not delivered while a
+session is suspended. A broker exits five minutes after its last client disconnects.
+
+When no worker leases remain for the configured idle timeout, the server stops
+together with its language servers. If a server or its
 supervisor crashes, the next session start cleans it up and starts a fresh one.
 
-If a shared server cannot be started or reached within a few seconds, the session runs its own
-private Serena, as it would without serena-shared, and the reason is printed to stderr. A
-server that is merely slow to start keeps starting in the background, and later sessions use it.
+If a shared server cannot be started or reached within the startup budget, the client
+receives an error. A server that is merely slow to start keeps starting in the background,
+and a later client can use it. Startup contention never creates duplicate private servers.
 
 Any other use of the command (for example `serena-shared --version`, or a configuration without
 `--project-from-cwd`) runs Serena directly, unchanged.
@@ -205,7 +217,7 @@ dashboard would listen on a local TCP port. Serena's MCP server also keeps its p
 against requests from web pages (DNS-rebinding protection).
 
 serena-shared refuses to use a state directory that is a symlink or belongs to another user,
-and runs a private Serena instead.
+and reports an error.
 
 ## Limitations
 

@@ -36,8 +36,8 @@ from serena_shared.core import (
 
 DEFAULT_IDLE_SECONDS = 1800
 # Total time a client spends getting a shared server (queueing for the lock, cleanup, waiting
-# for startup) before it runs a private Serena instead. MCP clients give a server about 10 s (Codex) to 30 s (Claude Code)
-# to start, and the private fallback needs time too. A slow server keeps starting in the
+# for startup) before reporting an error. MCP clients give a server about 10 s (Codex) to 30 s (Claude Code)
+# to start. A slow server keeps starting in the
 # background and later sessions use it.
 START_WAIT_SECONDS = 6
 DISCARD_BUDGET_SECONDS = 3 * DISCARD_STEP_SECONDS + 1  # discard's worst case plus a spawn
@@ -102,8 +102,7 @@ def _attach(state: ServerState, command: list[str], root: Path) -> tuple[str, IO
     client's lease. Runs under `lock`, and takes the lease before releasing it, so the
     server cannot be reaped between attach and first request.
 
-    Raises NotShareable when no shared server can be had; the caller then runs a private
-    Serena rather than leaving the client without one."""
+    Raises NotShareable when no shared server can be had; never starts a private server."""
     # One deadline per client covers queueing for the lock, cleanup and waiting, so clients
     # arriving together never add their waits up.
     deadline = time.monotonic() + START_WAIT_SECONDS
@@ -152,14 +151,12 @@ def main() -> None:
         if len(os.fsencode(state.socket)) > MAX_SOCKET_PATH:
             raise NotShareable(f"socket path too long ({state.socket}); set a shorter SERENA_SHARED_STATE_DIR")
     except NotShareable as exc:
-        _run_serena(serena, args, str(exc))
+        _fail(str(exc))
 
     command = [python, "-I", str(SERVE_UNIX), str(state.socket), *rewritten]
     try:
-        socket_path, lease = _attach(state, command, root)
-    except NotShareable as exc:
-        _run_serena(serena, args, str(exc))
-    with lease:
-        from serena_shared.relay import run_relay
+        from serena_shared.broker import launch_broker_client
 
-        run_relay(socket_path)
+        launch_broker_client(state, command, root)
+    except NotShareable as exc:
+        _fail(str(exc))
