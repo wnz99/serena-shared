@@ -18,15 +18,14 @@ from mcp.client.stdio import stdio_client
 pytestmark = pytest.mark.skipif(shutil.which("serena") is None, reason="serena not installed")
 
 SHIM = str(Path(sys.executable).with_name("serena-shared"))
-# Shared servers always run without a dashboard; these flags matter for the private-Serena
-# fallback, which would otherwise open a browser tab with a fresh SERENA_HOME's defaults.
+# Shared servers always run without a dashboard; passthrough invocations retain flags.
 NO_DASHBOARD = ("--enable-web-dashboard", "false", "--open-web-dashboard", "false")
 
 
 @pytest.fixture(autouse=True)
 def cold_backend_budget(tmp_path, monkeypatch):
     # Protocol/sharing tests must wait for cold language servers on loaded machines.
-    # test_attach.py separately checks the production six-second fallback budget.
+    # test_attach.py separately checks the production six-second startup budget.
     launcher = tmp_path / "serena-shared"
     launcher.write_text(
         f"#!{sys.executable}\n"
@@ -244,6 +243,9 @@ def test_supervisor_signalled_during_startup_leaves_no_orphan(repo, env, sig):
         [SHIM, "start-mcp-server", "--context=codex", "--project-from-cwd", "--agent-interface", "tools", *NO_DASHBOARD],
         cwd=repo, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
     )
+    # Worker attachment is lazy: a connected byte proxy alone starts no Serena.
+    first.stdin.write(INITIALIZE)
+    first.stdin.flush()
     deadline = time.monotonic() + 60
     starting = None
     while starting is None and time.monotonic() < deadline:
@@ -256,10 +258,8 @@ def test_supervisor_signalled_during_startup_leaves_no_orphan(repo, env, sig):
     assert starting, "never saw a starting server"
     os.kill(starting["supervisor_pid"], getattr(signal, sig))
 
-    # The waiting client falls back to a private Serena and still works.
-    first.stdin.write(INITIALIZE)
-    first.stdin.flush()
-    assert '"result"' in first.stdout.readline()
+    # The waiting client reports an explicit error and never starts a private Serena.
+    assert '"error"' in first.stdout.readline()
     first.stdin.close()
     first.wait(timeout=30)
 

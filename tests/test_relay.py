@@ -11,6 +11,12 @@ import httpx2
 from serena_shared.relay import Relay, sse_messages
 
 
+def sink(output):
+    async def send(data):
+        output.write(data)
+    return send
+
+
 def test_cli_and_fallback_import_without_the_mcp_sdk():
     result = subprocess.run([sys.executable, "-c", """
 import importlib.abc, sys
@@ -32,9 +38,8 @@ def test_sse_multiline_comments_and_event_ids():
     assert anyio.run(scenario) == [('{"id":1,\n"result":{}}', "7")]
 
 
-def test_negotiated_headers_json_responses_and_session_cleanup(monkeypatch):
+def test_negotiated_headers_json_responses_and_session_cleanup():
     output = io.StringIO()
-    monkeypatch.setattr(sys, "stdout", output)
     requests = []
 
     def respond(request):
@@ -50,7 +55,7 @@ def test_negotiated_headers_json_responses_and_session_cleanup(monkeypatch):
 
     async def scenario():
         async with httpx2.AsyncClient(transport=httpx2.MockTransport(respond)) as http:
-            proxy = Relay(http)
+            proxy = Relay(http, sink(output))
             proxy.initialize_id = 1
             async with anyio.create_task_group() as tasks:
                 await proxy.post({"jsonrpc": "2.0", "id": 1, "method": "initialize"}, tasks)
@@ -64,9 +69,8 @@ def test_negotiated_headers_json_responses_and_session_cleanup(monkeypatch):
     assert requests[-1].method == "DELETE"
 
 
-def test_interrupted_tool_stream_resumes_without_replaying_post(monkeypatch):
+def test_interrupted_tool_stream_resumes_without_replaying_post():
     output = io.StringIO()
-    monkeypatch.setattr(sys, "stdout", output)
     methods = []
 
     def respond(request):
@@ -84,7 +88,7 @@ def test_interrupted_tool_stream_resumes_without_replaying_post(monkeypatch):
     async def scenario():
         async with httpx2.AsyncClient(transport=httpx2.MockTransport(respond)) as http:
             async with anyio.create_task_group() as tasks:
-                await Relay(http).post({"jsonrpc": "2.0", "id": 3, "method": "tools/call"}, tasks)
+                await Relay(http, sink(output)).post({"jsonrpc": "2.0", "id": 3, "method": "tools/call"}, tasks)
 
     anyio.run(scenario)
     assert methods == ["POST", "GET"]
@@ -93,9 +97,8 @@ def test_interrupted_tool_stream_resumes_without_replaying_post(monkeypatch):
     assert messages[1]["id"] == 3
 
 
-def test_notification_stream_preserves_empty_priming_resume_id(monkeypatch):
+def test_notification_stream_preserves_empty_priming_resume_id():
     output = io.StringIO()
-    monkeypatch.setattr(sys, "stdout", output)
     calls = []
 
     def respond(request):
@@ -111,7 +114,7 @@ def test_notification_stream_preserves_empty_priming_resume_id(monkeypatch):
 
     async def scenario():
         async with httpx2.AsyncClient(transport=httpx2.MockTransport(respond)) as http:
-            await Relay(http).listen()
+            await Relay(http, sink(output)).listen()
 
     anyio.run(scenario)
     assert len(output.getvalue().splitlines()) == 1

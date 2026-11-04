@@ -4,16 +4,13 @@ from __future__ import annotations
 
 import contextlib
 import json
-import os
-import signal
-import sys
-import threading
+import time
 from collections.abc import AsyncIterator
 
 import anyio
 import httpx2
 
-from serena_shared.core import HTTP_BASE, warn
+from serena_shared.core import HTTP_BASE
 
 _NO_ID = object()
 
@@ -40,16 +37,18 @@ async def sse_messages(response: httpx2.Response) -> AsyncIterator[tuple[str, st
 
 
 class Relay:
-    def __init__(self, http: httpx2.AsyncClient):
+    def __init__(self, http: httpx2.AsyncClient, send):
         self.http = http
         self.session_id: str | None = None
         self.protocol: str | None = None
         self.initialize_id = _NO_ID
-        self.initialized = anyio.Event()
-        self.notified = anyio.Event()
-        self.notification_started = False
         self.writing = anyio.Lock()
         self.listening = False
+        self.send = send
+        self.replaying = False
+        self.server_requests = set()
+        self.listen_scope = None
+        self.initialize_result = None
 
     def headers(self, last_event_id: str | None = None) -> dict[str, str]:
         headers = {"Accept": "application/json, text/event-stream"}
@@ -67,18 +66,18 @@ class Relay:
             raise ValueError("expected a JSON-RPC object from Serena")
         if message.get("id", _NO_ID) == self.initialize_id and "method" not in message:
             result = message.get("result")
+            self.initialize_result = result
             if isinstance(result, dict) and isinstance(result.get("protocolVersion"), str):
                 self.protocol = result["protocolVersion"]
-            self.initialized.set()
+            if self.replaying:
+                if "error" in message:
+                    raise RuntimeError("Serena rejected session reinitialization")
+                return message
+        if "method" in message and "id" in message:
+            self.server_requests.add(message['id'])
         async with self.writing:
-            await anyio.to_thread.run_sync(self.write_line, data)
+            await self.send(json.dumps(message, separators=(",", ":")) + "\n")
         return message
-
-    @staticmethod
-    def write_line(data: str) -> None:
-        # Multiline SSE data is one newline-delimited stdio message.
-        sys.stdout.write(json.dumps(json.loads(data), separators=(",", ":")) + "\n")
-        sys.stdout.flush()
 
     async def read_response(self, response: httpx2.Response, request_id=_NO_ID) -> tuple[bool, str | None]:
         last_event_id = None
@@ -93,6 +92,11 @@ class Relay:
         return False, last_event_id
 
     async def listen(self) -> None:
+        with anyio.CancelScope() as scope:
+            self.listen_scope = scope
+            await self._listen()
+
+    async def _listen(self) -> None:
         last_event_id = None
         # GET is safe to reconnect. POSTs are never replayed: they may execute tools.
         for attempt in range(4):
@@ -114,6 +118,8 @@ class Relay:
         raise RuntimeError("Serena's notification stream closed repeatedly")
 
     async def post(self, message: dict, tasks: anyio.abc.TaskGroup) -> None:
+        if 'method' not in message:
+            self.server_requests.discard(message.get('id'))
         request_id = message.get("id", _NO_ID)
         async with self.http.stream("POST", f"{HTTP_BASE}/mcp", json=message, headers=self.headers()) as response:
             response.raise_for_status()
@@ -122,7 +128,6 @@ class Relay:
             if response.status_code == 202:
                 if message.get("method") == "notifications/initialized" and not self.listening:
                     self.listening = True
-                    self.notified.set()
                     tasks.start_soon(self.listen)
                 return
             if response.headers.get("content-type", "").split(";")[0].strip() == "application/json":
@@ -143,26 +148,6 @@ class Relay:
                     return
         raise RuntimeError("Serena's request stream could not be resumed")
 
-    async def read_stdin(self, tasks: anyio.abc.TaskGroup) -> None:
-        while line := await anyio.to_thread.run_sync(sys.stdin.buffer.readline, abandon_on_cancel=True):
-            try:
-                message = json.loads(line)
-                if not isinstance(message, dict):
-                    raise ValueError("expected an object")
-            except (ValueError, UnicodeError):
-                warn("ignoring unreadable client JSON-RPC message")
-                continue
-            if message.get("method") == "initialize":
-                self.initialize_id = message.get("id", _NO_ID)
-            elif self.initialize_id is not _NO_ID:
-                await self.initialized.wait()
-            if message.get("method") == "notifications/initialized":
-                self.notification_started = True
-            elif self.notification_started:
-                await self.notified.wait()
-            tasks.start_soon(self.post, message, tasks)
-        tasks.cancel_scope.cancel()
-
     async def close(self) -> None:
         if self.session_id:
             with anyio.move_on_after(2, shield=True):
@@ -170,27 +155,112 @@ class Relay:
                     await self.http.delete(f"{HTTP_BASE}/mcp", headers=self.headers())
 
 
-async def relay(socket_path: str) -> None:
-    async with httpx2.AsyncClient(
-        transport=httpx2.AsyncHTTPTransport(uds=socket_path),
-        timeout=httpx2.Timeout(30.0, read=None),
-    ) as http:
-        proxy = Relay(http)
+class IdleSession:
+    """A connected stdio client need not pin an unused HTTP session or worker lease."""
+
+    def __init__(self, attach, tasks, send, idle_seconds):
+        self.attach = attach
+        self.tasks = tasks
+        self.send = send
+        self.idle_seconds = idle_seconds
+        self.proxy = None
+        self.http = None
+        self.lease = None
+        self.initialization = None
+        self.ready = False
+        self.active = 0
+        self.touched = time.monotonic()
+        self.lock = anyio.Lock()
+        self.initialize_result = None
+        self.stateful = False
+
+    async def disconnect(self):
+        if self.proxy is not None:
+            if self.proxy.listen_scope is not None:
+                self.proxy.listen_scope.cancel()
+            await self.proxy.close()
+        if self.http is not None:
+            await self.http.aclose()
+        if self.lease is not None:
+            self.lease.close()
+        self.proxy = self.http = self.lease = None
+
+    async def connect(self):
+        socket_path, self.lease = await self.attach()
+        self.http = httpx2.AsyncClient(
+            transport=httpx2.AsyncHTTPTransport(uds=socket_path),
+            timeout=httpx2.Timeout(30.0, read=None),
+        )
+        self.proxy = Relay(self.http, self.send)
+        if self.initialization is not None and self.ready:
+            self.proxy.initialize_id = self.initialization['id']
+            self.proxy.replaying = True
+            await self.proxy.post(self.initialization, self.tasks)
+            if self.proxy.initialize_result != self.initialize_result:
+                raise RuntimeError('Serena capabilities changed while idle; restart the client')
+            await self.proxy.post({'jsonrpc': '2.0', 'method': 'notifications/initialized'}, self.tasks)
+            self.proxy.replaying = False
+
+    async def post(self, message):
+        async with self.lock:
+            if self.proxy is None:
+                try:
+                    await self.connect()
+                except Exception as error:
+                    if 'id' in message and 'method' in message:
+                        await self.send(json.dumps({
+                            'jsonrpc': '2.0', 'id': message['id'],
+                            'error': {'code': -32000, 'message': f'Cannot attach shared Serena: {error}'},
+                        }) + '\n')
+                    raise
+            proxy = self.proxy
+            if message.get('method') == 'initialize':
+                self.initialization = message
+                proxy.initialize_id = message.get('id', _NO_ID)
+            self.active += 1
         try:
-            async with anyio.create_task_group() as tasks:
-                async def stop_on_signal() -> None:
-                    with anyio.open_signal_receiver(signal.SIGTERM, signal.SIGHUP, signal.SIGINT) as signals:
-                        async for _ in signals:
-                            # A thread blocked on an open stdin cannot be cancelled at shutdown.
-                            timer = threading.Timer(5, os._exit, args=(0,))
-                            timer.daemon = True
-                            timer.start()
-                            tasks.cancel_scope.cancel()
-                tasks.start_soon(proxy.read_stdin, tasks)
-                tasks.start_soon(stop_on_signal)
+            await proxy.post(message, self.tasks)
+            if message.get('method') == 'initialize':
+                self.initialize_result = proxy.initialize_result
+            if message.get('method') in ('resources/subscribe', 'logging/setLevel'):
+                # These alter session state beyond the initialization handshake.
+                # Preserve their session rather than silently losing that state.
+                self.stateful = True
+            if message.get('method') == 'notifications/initialized':
+                self.ready = True
         finally:
-            await proxy.close()
+            self.active -= 1
+            self.touched = time.monotonic()
+
+    async def reap(self):
+        while True:
+            await anyio.sleep(min(self.idle_seconds, 1))
+            async with self.lock:
+                if (self.ready and not self.stateful and self.proxy is not None and not self.active
+                        and not self.proxy.server_requests
+                        and time.monotonic() - self.touched >= self.idle_seconds):
+                    await self.disconnect()
 
 
-def run_relay(socket_path: str) -> None:
-    anyio.run(relay, socket_path)
+async def client_session(receive, send, attach, idle_seconds=300):
+    """Broker entrypoint; I/O and worker ownership belong to the individual client."""
+    session = None
+    try:
+        async with anyio.create_task_group() as tasks:
+            session = IdleSession(attach, tasks, send, idle_seconds)
+            tasks.start_soon(session.reap)
+            # Read one message at a time through initialization. Once initialized,
+            # POSTs run concurrently, including responses to server-side requests.
+            while line := await receive():
+                message = json.loads(line)
+                if not isinstance(message, dict):
+                    raise ValueError('expected a JSON-RPC object')
+                if not session.ready:
+                    await session.post(message)
+                else:
+                    tasks.start_soon(session.post, message)
+            tasks.cancel_scope.cancel()
+    finally:
+        if session is not None:
+            with anyio.CancelScope(shield=True):
+                await session.disconnect()
